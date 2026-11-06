@@ -26,6 +26,9 @@ CLI=$SDK/out/linux-amd64/Release/rexglue
 mkdir -p "$SRC"
 rsync -rlc --delete --exclude /out --exclude /game --exclude /generated --exclude /.git "$GIT_DIR/" "$SRC/"
 [ -f "$SRC/game/extracted/default.xex" ] || { echo "no game files: $SRC/game/extracted/default.xex"; exit 1; }
+# Switch only: skip_msr (the SDK's one process-wide mtmsrd mutex cost the Castlevania port a third of its
+# worker time). The flag goes into the copy's [entrypoint]; the PC manifest stays as it is.
+sed -i '/^\[entrypoint\]$/a skip_msr = true' "$SRC/$MANIFEST"
 # The edits go onto a clean SDK whenever they changed: a newer sdk-edits.py on an SDK that holds an older
 # one's inserts keeps stale code (hcu-switch 0.106: the game hung after its intro). The SDK's HEAD is the
 # commit with patches/rexglue-sdk applied.
