@@ -55,7 +55,20 @@ endif()
 
 include(generated/rexglue.cmake)
 
-add_executable(tmnt switch/tmnt_nx_main.cpp)
+# The game hooks of the PC build (CMakeLists.txt), without the launcher and online play: the FIRE menu without
+# Xbox Live entries, the Live stat fixes, the languages (pt-BR text and font), the saved title music level.
+add_executable(tmnt switch/tmnt_nx_main.cpp
+    src/fire_menu_hook.cpp src/fire_movie_patch.cpp src/live_fix.cpp src/live_stats.cpp src/local_stats.cpp
+    src/localization/font_patch.cpp src/localization/game_text.cpp src/localization/game_text_hook.cpp
+    src/localization/pt_br_game_text.cpp src/localization/pt_br_ui_text.cpp src/localization/ui_text.cpp
+    src/title_bgm_level.cpp)
+# TMNT_r.xex hooks (skip intro, title music, subtitles), as on the PC; live_hooks_tmnt_r.cpp is online play.
+# In the joined module object (ld -r) these strong bodies win over the generated weak aliases.
+if(TARGET tmnt_turtles_in_time_reshelled_TMNT_r)
+    target_sources(tmnt_turtles_in_time_reshelled_TMNT_r PRIVATE src/title_bgm_level_tmnt_r.cpp
+        src/skip_intro_tmnt_r.cpp src/localization/subtitle_default_tmnt_r.cpp)
+    target_include_directories(tmnt_turtles_in_time_reshelled_TMNT_r PRIVATE src)
+endif()
 rexglue_setup_target(tmnt GPU_PLUGINS xenos)
 set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/module_registry.cpp" APPEND PROPERTY
              COMPILE_DEFINITIONS REX_STATIC_MODULES=1)

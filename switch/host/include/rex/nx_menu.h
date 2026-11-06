@@ -14,6 +14,8 @@ int rex_nx_setting_rumble(void);       // 0 / 1
 int rex_nx_setting_volume(void);       // 0-100
 int rex_nx_setting_fps_counter(void);  // 0 / 1
 int rex_nx_setting_button_icons(void); // 0 = the game's Xbox glyphs, 1 = swapped for the Switch (nx_glyphs.cpp)
+int rex_nx_setting_skip_intro(void);  // 0 / 1 (tmnt_skip_intro, read at start)
+int rex_nx_setting_language(void);    // 0-5 = en, fr, de, it, es, pt-BR (tmnt_language, read at start)
 int rex_nx_debug_record(void);         // 1 = a 5 s recording asked (the file record_now; the backend sets it back to 0 when done)
 void rex_nx_debug_record_set(int on);
 

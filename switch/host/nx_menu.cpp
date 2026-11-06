@@ -24,7 +24,7 @@ constexpr uint16_t kUp = 0x0001, kDown = 0x0002, kLeft = 0x0004, kRight = 0x0008
                    kLS = 0x0040, kRS = 0x0080, kA = 0x1000, kB = 0x2000;
 constexpr uint16_t kChord = kLS | kRS;  // L3+R3 opens and closes the menu (minus = the 360's BACK opens the game's own menu)
 
-std::atomic<int> g_fps_mode{1}, g_rumble{1}, g_volume{10}, g_fps_counter{1}, g_button_icons{1};  // release defaults: 30 fps (even pacing), fps counter on; volume in steps of 10
+std::atomic<int> g_fps_mode{1}, g_rumble{1}, g_volume{10}, g_fps_counter{1}, g_button_icons{1}, g_skip_intro{0}, g_language{0};  // release defaults: 30 fps (even pacing), fps counter on; volume in steps of 10
 std::atomic<int> g_record{0};  // 1 = the backend records the shown frames for 5 s (frame_recorder.cpp, the file record_now), then sets 0
 
 struct Item {
@@ -39,6 +39,8 @@ Item kItems[] = {
     {"VOLUME", &g_volume, 11, {"0", "10", "20", "30", "40", "50", "60", "70", "80", "90", "100"}},
     {"FPS COUNTER", &g_fps_counter, 2, {"OFF", "ON"}},
     {"BUTTON ICONS *", &g_button_icons, 2, {"XBOX", "SWITCH"}},  // * = after a restart (nx_glyphs.cpp)
+    {"SKIP INTRO *", &g_skip_intro, 2, {"OFF", "ON"}},
+    {"LANGUAGE *", &g_language, 6, {"EN", "FR", "DE", "IT", "ES", "PT-BR"}},  // rex_nx_setting_language
     {"EXIT GAME", nullptr, 0, {}},
 };
 constexpr int kItemCount = int(sizeof(kItems) / sizeof(kItems[0]));
@@ -65,6 +67,8 @@ void Load() {
       if (!std::strcmp(line, "volume")) g_volume = v < 0 ? 0 : v > 100 ? 10 : v / 10;
       if (!std::strcmp(line, "fps_counter")) g_fps_counter = v ? 1 : 0;
       if (!std::strcmp(line, "button_icons")) g_button_icons = v ? 1 : 0;
+      if (!std::strcmp(line, "skip_intro")) g_skip_intro = v ? 1 : 0;
+      if (!std::strcmp(line, "language")) g_language = v < 0 || v > 5 ? 0 : v;
     }
     std::fclose(fp);
     std::printf("[nx] settings: fps %d rumble %d volume %d fps_counter %d (%s)\n", g_fps_mode.load(), g_rumble.load(),
@@ -89,8 +93,9 @@ void Save() {
     std::printf("[nx] settings: cannot write %s\n", kSettingsPath);
     return;
   }
-  std::fprintf(fp, "fps=%d\nrumble=%d\nvolume=%d\nfps_counter=%d\nbutton_icons=%d\n", g_fps_mode.load(), g_rumble.load(),
-               g_volume.load() * 10, g_fps_counter.load(), g_button_icons.load());
+  std::fprintf(fp, "fps=%d\nrumble=%d\nvolume=%d\nfps_counter=%d\nbutton_icons=%d\nskip_intro=%d\nlanguage=%d\n",
+               g_fps_mode.load(), g_rumble.load(),
+               g_volume.load() * 10, g_fps_counter.load(), g_button_icons.load(), g_skip_intro.load(), g_language.load());
   std::fclose(fp);
   std::printf("[nx] settings: saved fps %d rumble %d volume %d fps_counter %d\n", g_fps_mode.load(), g_rumble.load(),
               g_volume.load() * 10, g_fps_counter.load());
@@ -200,6 +205,17 @@ extern "C" int rex_nx_setting_rumble(void) { return g_rumble.load(); }
 extern "C" int rex_nx_setting_volume(void) { return g_volume.load() * 10; }
 extern "C" int rex_nx_setting_fps_counter(void) { return g_fps_counter.load(); }
 extern "C" int rex_nx_setting_button_icons(void) { return g_button_icons.load(); }
+// Read once at start, before the menu has loaded the file.
+extern "C" int rex_nx_setting_skip_intro(void) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_loaded) Load();
+  return g_skip_intro.load();
+}
+extern "C" int rex_nx_setting_language(void) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_loaded) Load();
+  return g_language.load();
+}
 extern "C" int rex_nx_debug_record(void) { return g_record.load(); }
 extern "C" void rex_nx_debug_record_set(int on) { g_record.store(on); }
 
