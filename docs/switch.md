@@ -13,7 +13,9 @@ A homebrew NRO for a Switch running Atmosphère, built from the same recompiled 
 | `/switch/tmnt/tmnt_log.txt` | The log of the last run |
 
 The licence is the full game (`--license_mask`, as `config/tmnt_turtles_in_time_reshelled.toml` on PC).
-Rumble works. **L3 + R3** opens the settings menu.
+Rumble works. **L3 + R3** opens the settings menu: frame rate, rumble, volume, fps counter, button icons,
+skip intro and the language (en, fr, de, it, es, pt-BR; the last two after a restart).
+The game hooks of the PC build are in, except online play: the FIRE menu has no Xbox Live entries.
 
 ## Building
 
@@ -33,7 +35,7 @@ The build runs in WSL or Linux with devkitPro (devkitA64, libnx, deko3d, uam) an
 | Part | Files |
 | --- | --- |
 | CMake | `CMakeLists.txt` hands a Switch build to `switch/switch.cmake` and returns; the PC targets are untouched |
-| Entry | `switch/tmnt_nx_main.cpp`: the plain ReXApp, without the launcher, online play and overlays |
+| Entry | `switch/tmnt_nx_main.cpp`: the plain ReXApp with the game hooks, without the launcher, online play and overlays |
 | Host layer | `switch/host/`: memory, fibers, exceptions, threads, window, input with rumble, the settings menu |
 | SDK edits | `switch/sdk-edits.py` (Horizon support), `switch/sdk-edits-tmnt.py` (GCC fixes for this repo's patches) |
 | Renderer | `src/gpu/deko3d_backend.cpp` (deko3d), `src/gpu/trace_backend.cpp` (shader dumps), `tools/xenos2glsl.py` |
