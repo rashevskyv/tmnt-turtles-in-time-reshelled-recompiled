@@ -6,6 +6,12 @@ project(tmnt_turtles_in_time_reshelled VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Nintendo Switch (devkitA64 + libnx): its own target list, without the PC launcher (switch/switch.cmake).
+if(NINTENDO_SWITCH)
+    include(switch/switch.cmake)
+    return()
+endif()
+
 # Where tools/codegen.ps1 and tools/package-linux.sh unpack the pinned SDK.
 if(WIN32)
     set(TMNT_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/rexglue/win-amd64")
