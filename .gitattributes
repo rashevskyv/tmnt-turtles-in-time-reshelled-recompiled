@@ -12,3 +12,12 @@ patches/appimage-runtime/* text eol=lf
 
 # The TRG Launcher patches apply with git apply --ignore-whitespace on both platforms.
 patches/trg-launcher/* text eol=lf
+
+# The Switch build runs in WSL.
+switch/** text eol=lf
+src/gpu/** text eol=lf
+tools/xenos2glsl.py text eol=lf
+tools/nro_nacp.py text eol=lf
+tools/dlc_modules.py text eol=lf
+tools/module_keep_symbols.py text eol=lf
+tools/stfs_icon.py text eol=lf

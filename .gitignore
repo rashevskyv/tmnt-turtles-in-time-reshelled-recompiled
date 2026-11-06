@@ -46,3 +46,5 @@ __pycache__/
 # Local AI agent instructions
 CLAUDE.md
 .claude/
+# Switch logs and symbols fetched from the console
+/switch/logs/
