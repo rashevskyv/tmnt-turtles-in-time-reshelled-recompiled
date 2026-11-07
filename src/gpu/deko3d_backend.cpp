@@ -1164,8 +1164,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // Mode 30 also halves the guest's vblank interrupt rate (the SDK's vsync worker, sdk-edits rule 31): the game
     // starts its frames at a vblank and times them by mftb, so with 60 Hz vblanks under a 30 Hz present its frames
     // alternated 17 / 50 ms (console 0.249: 5-8 frames of 50 ms per second with the presents even) = uneven
-    // motion. The file sdmc:/switch/tmnt/vblank60 keeps the 60 Hz vblanks (the 0.249 behaviour) for an A/B.
-    const bool vblank60 = access((debug_dir_ + "vblank60").c_str(), F_OK) == 0;
+    // motion. That was Castlevania. TMNT counts vblanks for its game time: at 30 Hz vblanks the menu ran at half
+    // speed (console 0.50), so the vblanks stay at 60 Hz; the file sdmc:/switch/tmnt/vblank30 halves them for an A/B.
+    const bool vblank60 = access((debug_dir_ + "vblank30").c_str(), F_OK) != 0;
     const int divider = interval == 2 && !vblank60 ? 2 : 1;
     if (interval == swap_interval_ && divider == rex_nx_vblank_divider && swaps_) return;
     swap_interval_ = interval;
