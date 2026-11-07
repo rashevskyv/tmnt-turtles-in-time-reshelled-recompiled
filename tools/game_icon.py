@@ -13,8 +13,15 @@ from PIL import Image, ImageDraw, ImageFilter
 game, out = sys.argv[1:3]
 icon = Image.open(f'{game}/title_icon.png').convert('RGB').resize((256, 256), Image.LANCZOS)
 icon = icon.filter(ImageFilter.GaussianBlur(3))
-logo = Image.open(f'{game}/banner.png').convert('RGB').crop((0, 0, 176, 95))  # the logo; the turtles are right of it
-w = 250
+banner = Image.open(f"{game}/banner.png").convert("RGB")
+# The logo is x 4-184 (the turtles are right of it) and touches the left and top edges: a margin of the edge
+# pixels keeps the soft mask off the letters (0.48: the first letter faded out).
+logo = Image.new("RGB", (220, 107))
+logo.paste(banner.crop((0, 0, 188, 95)), (16, 12))
+logo.paste(banner.crop((0, 0, 1, 95)).resize((16, 95)), (0, 12))
+logo.paste(banner.crop((187, 0, 188, 95)).resize((16, 95)), (204, 12))
+logo.paste(logo.crop((0, 12, 220, 13)).resize((220, 12)), (0, 0))
+w = 240
 h = round(logo.height * w / logo.width)
 logo = logo.resize((w, h), Image.LANCZOS)
 mask = Image.new('L', (w, h), 0)
