@@ -478,6 +478,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
     present_target_ = access((debug_dir + "dk_present_rt").c_str(), F_OK) == 0;
     dump_images_ = access((debug_dir + "dk_dump").c_str(), F_OK) == 0;  // readback dumps stall the GPU: debug only
     debug_dir_ = debug_dir;
+    if (FILE* sf = std::fopen((debug_dir + "dk_skip").c_str(), "r")) {
+      unsigned long long v, p;
+      while (std::fscanf(sf, "%llx %llx", &v, &p) == 2) skip_pairs_.insert(PairKey({v, p}));
+      std::fclose(sf);
+      Log("dk_skip: the draws of %zu shader pairs are skipped (suspects of a GPU fault)", skip_pairs_.size());
+    }
     ReadFpsMode();
     trace_start_ms_ = NowMs();
     trace_enabled_ = access((debug_dir + "dk_trace").c_str(), F_OK) == 0;
@@ -771,6 +777,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     ds.stencilTestEnable = 0;
     dkCmdBufBindDepthStencilState(cmd, &ds);
 
+    if (!skip_pairs_.empty() && skip_pairs_.count(PairKey({vs->ucode_data_hash(), ps->ucode_data_hash()}))) { skipped_++; return true; }
     // Shaders (the whole graphics mask: a stage without a shader here is unbound).
     DkShader const* shaders[3] = {&vs->shader, &ps->shader, &vs->geom};
     dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, shaders, use_gs ? 3 : 2);
@@ -1179,6 +1186,26 @@ class Deko3dCommandProcessor : public CommandProcessor {
       Log("  VS %016llX PS %016llX x%u", (unsigned long long)p.first.first, (unsigned long long)p.first.second, p.second);
     std::fflush(stdout);
   }
+  static uint64_t PairKey(const std::pair<uint64_t, uint64_t>& d) { return d.first * 0x9E3779B97F4A7C15ull ^ d.second; }
+  // The pairs of a hung or faulted frame that never ran in a finished frame: appended to dk_skip (next to the shaders
+  // folder), and the next start skips their draws. ponytail: a fault outside draws (a copy, a resolve) bans innocent
+  // pairs; delete dk_skip to undo.
+  void NoteFaultedFrame(const Frame& f) {
+    LogHungFrame(f);
+    int n = 0;
+    if (FILE* o = std::fopen((debug_dir_ + "dk_skip").c_str(), "a")) {
+      for (const auto& d : f.draw_log) {
+        if (ok_pairs_.count(PairKey(d)) || !skip_pairs_.insert(PairKey(d)).second) continue;
+        std::fprintf(o, "%016llX %016llX\n", (unsigned long long)d.first, (unsigned long long)d.second);
+        Log("  suspect VS %016llX PS %016llX: its draws are skipped from the next start", (unsigned long long)d.first,
+            (unsigned long long)d.second);
+        n++;
+      }
+      std::fclose(o);
+    }
+    Log("%d suspect pairs added to %sdk_skip", n, debug_dir_.c_str());
+    std::fflush(stdout);
+  }
 
   void NextFrame(bool drawn) {
     if (!(skip_odd_ && frames_[frame_].fenced) || dkFenceWait(&frames_[frame_].fence, 0) == DkResult_Success) busy_run_ = 0;
@@ -1243,9 +1270,18 @@ class Deko3dCommandProcessor : public CommandProcessor {
       DkResult r = dkFenceWait(&f.fence, 2000000000ll);  // 2 s: a hang is logged, not silent
       t_fence_ms_ += NowMs() - fw0;
       rex_nx_waited_add(uint64_t((NowMs() - fw0) * 19200.0));
+      // A fence done without the frame's end timestamp: the kernel signalled it after a GPU fault (console 0.57,
+      // the first cutscene; the next acquire then aborts). A hung or faulted frame's new shader pairs go to dk_skip.
+      const uint64_t* ts = f.ts_off != UINT32_MAX ? reinterpret_cast<const uint64_t*>(f.data.cpu + f.ts_off) : nullptr;
       if (r != DkResult_Success) {
         Log("frame %u: fence wait result %d (GPU hang?)", frame_, int(r));
-        LogHungFrame(f);
+        NoteFaultedFrame(f);
+      } else if (ts && !ts[2] && !ts[3]) {
+        Log("frame %u: fence done without its end timestamp (GPU fault)", frame_);
+        NoteFaultedFrame(f);
+      } else {
+        for (size_t i = 0; i < f.draw_log.size(); i++)
+          if (!i || f.draw_log[i] != f.draw_log[i - 1]) ok_pairs_.insert(PairKey(f.draw_log[i]));
       }
       if (swaps_ < 6) Log("frame %u: fence done", frame_);
       f.fenced = false;
@@ -2135,6 +2171,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
 #endif
   bool skip_odd_ = false;   // ReadFpsMode: the 30 mode
   bool skip_frame_ = false; // this frame is not drawn (NextFrame)
+  std::unordered_set<uint64_t> ok_pairs_, skip_pairs_;  // PairKey: ran in a finished frame / skipped (dk_skip)
   uint32_t busy_run_ = 0;   // frames skipped in a row for a busy GPU
   std::chrono::steady_clock::time_point next_swap_{};  // the "30" swap limiter (IssueSwap)
   bool begun_ = true;       // frames_[frame_] is ready for recording (BeginFrame ran)
