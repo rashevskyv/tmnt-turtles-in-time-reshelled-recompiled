@@ -6,7 +6,7 @@ its translator_disasm.cpp. Only what the game's shaders use is implemented; anyt
 with a clear message so the gap is visible (docs/native-renderer-plan.md, M2).
 
 Interface of the generated GLSL (the deko3d backend relies on it):
-  vertex:   layout(location = a) in vec4 in_a      one per vfetch, in instruction order; the
+  vertex:   layout(location = a) in vec4 in_a      one per vfetch that reads data (in instruction order); the
             sidecar JSON lists (slot, offset, format, stride, signed, integer) per attribute;
             binding 0 = uniform Consts { vec4 c[256]; } (the ALU constants c0..c255);
             binding 1 = uniform Sys (ndc_scale, ndc_offset, alpha test, bool constants);
@@ -178,6 +178,12 @@ class Translator:
         if op == 'vfetch_full':
             self.cur_slot = slot
             self.stride_words = int(kv.get('Stride', '0'))
+        if all(ch in (None, '0', '1') for ch in comps):
+            # Only constants (vfetch_full r1.0001): the SDK lists no attribute for it, so none here either, or
+            # every later in_a would sit one location after the data the backend binds (TMNT 0.48: the
+            # sprites took their uv as position and the title screen stayed black).
+            self.body.extend(self.write_masked(target, comps, 'vec4(0.0)', False))
+            return
         attr = {
             'index': len(self.attrs),
             'slot': self.cur_slot,
