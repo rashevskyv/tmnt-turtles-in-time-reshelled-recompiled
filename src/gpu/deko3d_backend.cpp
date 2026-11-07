@@ -1173,12 +1173,14 @@ class Deko3dCommandProcessor : public CommandProcessor {
   // The frame-rate mode (the settings menu, nx_menu.cpp; read at start and every 60 swaps, so it switches during a run).
   // "60" = every frame drawn. "30" = hcu-switch's 30skip (NextFrame): the guest keeps 60 frames a second, every second
   // one is drawn. TMNT counts frames for its game time: a 30 Hz present or 30 Hz vblanks (Castlevania's "30", console
-  // 0.50) ran it at half speed.
+  // 0.50) ran it at half speed. The drawn frames of "30" go out every second vblank: a skipped frame waits for nothing,
+  // so with interval 1 the menus ran at 120 swaps a second (console 0.53: the fps counter said 60 in "30").
   void ReadFpsMode() {
     if (!debug_dir_.empty() && unlink((debug_dir_ + "record_now").c_str()) == 0) rex_nx_debug_record_set(1);
     const bool skip = rex_nx_setting_fps_mode() == 1;
     if (skip == skip_odd_ && swaps_) return;
     skip_odd_ = skip;
+    dkSwapchainSetSwapInterval(swapchain_, skip ? 2 : 1);
     std::printf("[nx] gpu: fps mode %s from swap #%u (%u frames skipped for a busy GPU so far)\n", skip ? "30 (every second frame drawn)" : "60",
                 swaps_, busy_skips_);
     std::fflush(stdout);
