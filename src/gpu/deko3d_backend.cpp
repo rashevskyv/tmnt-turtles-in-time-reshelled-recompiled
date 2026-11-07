@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -137,6 +138,7 @@ void Log(const char* fmt, ...) {
 
 void DebugCallback(void*, const char* context, DkResult result, const char* message) {
   Log("deko3d %s: result %d: %s", context ? context : "?", int(result), message ? message : "");
+  std::fflush(stdout);  // deko3d aborts right after an error (console 0.56: the message was lost)
 }
 
 struct MemBlock {
@@ -234,6 +236,7 @@ struct Frame {
   bool rec_pending = false;  // RECORD 5 SEC: this frame's shown image waits in rec_ for the fence
   uint32_t rec_swap = 0;
   uint64_t rec_us = 0;
+  std::vector<std::pair<uint64_t, uint64_t>> draw_log;  // VS, PS of each draw: printed when the frame hangs the GPU
 };
 
 DkCompareOp CompareOp(xenos::CompareFunction f) { return DkCompareOp(uint32_t(f)); }
@@ -890,6 +893,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       trace_lines_.emplace_back(line);
     }
     if (ps->ucode_data_hash() == 0xB3EC630B32280C8Cull) frame_sprite_draws_++;
+    f.draw_log.emplace_back(vs->ucode_data_hash(), ps->ucode_data_hash());
     draws_++;
     frame_draws_++;
     phase(6);
@@ -903,6 +907,13 @@ class Deko3dCommandProcessor : public CommandProcessor {
   }
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width, uint32_t frontbuffer_height) override {
+    if (skip_odd_) {
+      // "30": no present waits for a vblank in a skipped frame, so every swap is held to 60 a second here
+      // (console 0.53: the menus ran at 120 swaps a second; 0.56's swap interval 2 lost frames to the vblank pairs).
+      const auto now = std::chrono::steady_clock::now();
+      if (now < next_swap_) std::this_thread::sleep_until(next_swap_);
+      next_swap_ = std::max(now, next_swap_) + std::chrono::microseconds(16667);
+    }
     if (Skipping()) {
       swaps_++;  // nothing was recorded: the frame is just counted
       if (swaps_ % 60 == 0) {
@@ -1156,12 +1167,27 @@ class Deko3dCommandProcessor : public CommandProcessor {
   // one the GPU has no free frame slot for yet (its fence is still pending) instead of waiting: the guest keeps its 60
   // frames a second (the command processor still runs every packet: fences, write-backs, the guest's waits), the game
   // keeps its speed, every second frame is shown.
+  // The draws of a frame whose fence did not signal, by shader pair in order of first use (the hang's suspects).
+  void LogHungFrame(const Frame& f) {
+    std::vector<std::pair<std::pair<uint64_t, uint64_t>, uint32_t>> pairs;
+    for (const auto& d : f.draw_log) {
+      auto it = std::find_if(pairs.begin(), pairs.end(), [&](const auto& p) { return p.first == d; });
+      if (it == pairs.end()) pairs.push_back({d, 1}); else it->second++;
+    }
+    Log("hung frame: %zu draws, %zu shader pairs (in order of first use):", f.draw_log.size(), pairs.size());
+    for (const auto& p : pairs)
+      Log("  VS %016llX PS %016llX x%u", (unsigned long long)p.first.first, (unsigned long long)p.first.second, p.second);
+    std::fflush(stdout);
+  }
+
   void NextFrame(bool drawn) {
+    if (!(skip_odd_ && frames_[frame_].fenced) || dkFenceWait(&frames_[frame_].fence, 0) == DkResult_Success) busy_run_ = 0;
     skip_frame_ = false;
     if (skip_odd_ && drawn) {
       skip_frame_ = true;
     } else if (skip_odd_ && frames_[frame_].fenced && dkFenceWait(&frames_[frame_].fence, 0) != DkResult_Success) {
       skip_frame_ = true;
+      if (++busy_run_ == 120) LogHungFrame(frames_[frame_]);  // 2 s of a busy GPU: the frame hung it (console 0.53)
       busy_skips_++;
     }
     if (!skip_frame_ && !begun_) {
@@ -1173,14 +1199,13 @@ class Deko3dCommandProcessor : public CommandProcessor {
   // The frame-rate mode (the settings menu, nx_menu.cpp; read at start and every 60 swaps, so it switches during a run).
   // "60" = every frame drawn. "30" = hcu-switch's 30skip (NextFrame): the guest keeps 60 frames a second, every second
   // one is drawn. TMNT counts frames for its game time: a 30 Hz present or 30 Hz vblanks (Castlevania's "30", console
-  // 0.50) ran it at half speed. The drawn frames of "30" go out every second vblank: a skipped frame waits for nothing,
-  // so with interval 1 the menus ran at 120 swaps a second (console 0.53: the fps counter said 60 in "30").
+  // 0.50) ran it at half speed. A skipped frame of "30" waits for no vblank,
+  // so IssueSwap holds every swap to 60 a second (console 0.53: the menus ran at 120 swaps a second).
   void ReadFpsMode() {
     if (!debug_dir_.empty() && unlink((debug_dir_ + "record_now").c_str()) == 0) rex_nx_debug_record_set(1);
     const bool skip = rex_nx_setting_fps_mode() == 1;
     if (skip == skip_odd_ && swaps_) return;
     skip_odd_ = skip;
-    dkSwapchainSetSwapInterval(swapchain_, skip ? 2 : 1);
     std::printf("[nx] gpu: fps mode %s from swap #%u (%u frames skipped for a busy GPU so far)\n", skip ? "30 (every second frame drawn)" : "60",
                 swaps_, busy_skips_);
     std::fflush(stdout);
@@ -1218,10 +1243,14 @@ class Deko3dCommandProcessor : public CommandProcessor {
       DkResult r = dkFenceWait(&f.fence, 2000000000ll);  // 2 s: a hang is logged, not silent
       t_fence_ms_ += NowMs() - fw0;
       rex_nx_waited_add(uint64_t((NowMs() - fw0) * 19200.0));
-      if (r != DkResult_Success) Log("frame %u: fence wait result %d (GPU hang?)", frame_, int(r));
+      if (r != DkResult_Success) {
+        Log("frame %u: fence wait result %d (GPU hang?)", frame_, int(r));
+        LogHungFrame(f);
+      }
       if (swaps_ < 6) Log("frame %u: fence done", frame_);
       f.fenced = false;
     }
+    f.draw_log.clear();
 #ifndef TMNT_DK_GL
     if (f.rec_pending) {
       const uint32_t bytes = kRecW * kRecH * 4;
@@ -2106,6 +2135,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
 #endif
   bool skip_odd_ = false;   // ReadFpsMode: the 30 mode
   bool skip_frame_ = false; // this frame is not drawn (NextFrame)
+  uint32_t busy_run_ = 0;   // frames skipped in a row for a busy GPU
+  std::chrono::steady_clock::time_point next_swap_{};  // the "30" swap limiter (IssueSwap)
   bool begun_ = true;       // frames_[frame_] is ready for recording (BeginFrame ran)
   uint32_t busy_skips_ = 0;
   double shown_last_ms_ = 0;      // the last present (the shown-frame intervals of the dk time/s line)
