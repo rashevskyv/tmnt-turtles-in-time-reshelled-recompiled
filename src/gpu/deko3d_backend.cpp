@@ -567,7 +567,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     bool writes_depth = dc.z_enable && dc.z_write_enable;
     if (!writes_color && !writes_depth && !dc.stencil_enable) { skipped_++; return true; }
     if (IsClearDraw(vs, ps, prim_type)) return ClearDraw(index_count, mode);
-    if (!vs->loaded || !ps->loaded) { missing_draws_++; return true; }
+    if (!vs->loaded || !ps->loaded) { missing_draws_++; frame_missing_++; return true; }
     DkPrimitive prim;
     bool rects;
     if (!PrimitiveOf(prim_type, prim, rects)) { LogOnce("prim", "unsupported primitive type %u", uint32_t(prim_type)); skipped_++; return true; }

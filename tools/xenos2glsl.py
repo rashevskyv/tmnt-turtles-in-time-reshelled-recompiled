@@ -218,7 +218,10 @@ class Translator:
         self.textures[slot] = dim
         for p in parts[3:]:
             k = p.split('=')[0]
-            if k not in ('FetchValidOnly', 'UseComputedLOD', 'MagFilter', 'MinFilter', 'MipFilter', 'AnisoFilter'):
+            if p == 'UnnormalizedTextureCoords=true':
+                # Texel coordinates (TMNT's full-screen copy, 894498C723463852: without it the frame stayed black).
+                coord = '(%s) / vec2(textureSize(tf_%d, 0))' % (coord, int(parts[2][2:]))
+            elif k not in ('FetchValidOnly', 'UseComputedLOD', 'MagFilter', 'MinFilter', 'MipFilter', 'AnisoFilter'):
                 self.err('unsupported tfetch attribute %r' % p, rest)
         tmp = 'tex_%d' % self.tmp_counter()
         # Fragment: texture() = the Xenos computed LOD (the faithful translation; what Xenia emits). 0.258-0.276 used
