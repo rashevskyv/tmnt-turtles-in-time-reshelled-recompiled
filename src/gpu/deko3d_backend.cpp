@@ -188,6 +188,9 @@ struct HostImage {
   uint32_t checked_serial = 0;  // the draw serial of the last dirty-page check
   uint32_t guest_base = 0;    // textures and resolve destinations
   uint32_t edram_base = 0, edram_pitch = 0;  // render targets
+  // Last complete, aligned resolve rectangle, for composing adjacent tiled slices on fetch.
+  uint32_t resolve_pitch = 0, resolve_height = 0, resolve_frame = 0, resolve_format = 0, resolve_endian = 0;
+  uint32_t composed_child_serial = 0;
 };
 
 class DkShaderObj : public Shader {
@@ -229,7 +232,7 @@ struct Frame {
   struct TexBind {
     HostImage* tex;
     uint32_t handle, base, bytes, width, height;
-    bool from_resolve;
+    bool from_resolve, split_candidate;
   };
   std::unordered_map<uint64_t, TexBind> texbinds;
   // GPU timestamps: pipeline top at the frame's first command, bottom before the present (16-byte reports).
@@ -669,9 +672,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
         HostImage* tex = c.tex;
         bool valid = tex->guest_base == c.base && tex->width == c.width && tex->height == c.height && tex->from_resolve == c.from_resolve;
         if (valid && tex->checked_serial != serial_) {
-          if (MemoryChanged(*tex, c.base, c.bytes)) valid = false; else tex->checked_serial = serial_;
+          if (MemoryChanged(*tex, c.base, c.split_candidate ? tex->mem_bytes : c.bytes)) valid = false; else tex->checked_serial = serial_;
         }
         if (valid) {
+          if (c.split_candidate) ComposeAdjacentResolve(f, *tex);
           dkCmdBufBindTextures(cmd, DkStage_Fragment, tb.fetch_constant, &c.handle, 1);
           texset_key = (texset_key ^ c.base) * 0x100000001B3ull + tb.fetch_constant;
           if (tcount < 32) tnames[tcount++] = TexName{tb.fetch_constant, c.base, tex->width, tex->height};
@@ -690,6 +694,17 @@ class Deko3dCommandProcessor : public CommandProcessor {
       }
       HostImage* tex = TextureImage(f, info, fetch);
       if (!tex) { textures_ok = false; continue; }  // e.g. the staging ring is full this frame: draw next frame
+      const bool split_candidate = tex->from_resolve && info.is_tiled && tex->width > 32 && tex->height > 32 &&
+                                   info.dimension == xenos::DataDimension::k2DOrStacked && !info.is_stacked &&
+                                   info.memory.base_address == tex->guest_base && info.pitch == tex->width &&
+                                   info.format_info()->bytes_per_block() == 4 &&
+                                   uint32_t(info.format) == tex->resolve_format && uint32_t(info.endianness) == tex->resolve_endian;
+      if (tex->resolve_height && tex->resolve_height < tex->height) {
+        LogOnce("resolvepartscheck", "split fetch %08X %ux%u tiled %u pitch %u format %u endian %u; resolve pitch %u rows %u format %u endian %u eligible %u",
+                tex->guest_base, tex->width, tex->height, info.is_tiled, info.pitch, uint32_t(info.format), uint32_t(info.endianness),
+                tex->resolve_pitch, tex->resolve_height, tex->resolve_format, tex->resolve_endian, split_candidate);
+      }
+      if (split_candidate) ComposeAdjacentResolve(f, *tex);
       uint32_t swizzle = tex->from_resolve ? 0 : fetch.swizzle;
       if (swizzle && tex->reversed_channels) {
         uint32_t r = 0;
@@ -713,7 +728,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       }
       DkResHandle handle = dkMakeTextureHandle(slot, sampler);
       dkCmdBufBindTextures(cmd, DkStage_Fragment, tb.fetch_constant, &handle, 1);
-      f.texbinds[bind_key] = Frame::TexBind{tex, handle, tex->guest_base, tex->mem_bytes, tex->width, tex->height, tex->from_resolve};
+      f.texbinds[bind_key] = Frame::TexBind{tex, handle, tex->guest_base, tex->mem_bytes, tex->width, tex->height, tex->from_resolve, split_candidate};
       texset_key = (texset_key ^ info.memory.base_address) * 0x100000001B3ull + tb.fetch_constant;
       if (tcount < 32) tnames[tcount++] = TexName{tb.fetch_constant, info.memory.base_address, tex->width, tex->height};
     }
@@ -1606,6 +1621,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
         r->checked_serial = 0;
         r->guest_base = 0;
         r->edram_base = r->edram_pitch = 0;
+        r->resolve_pitch = r->resolve_height = r->resolve_frame = r->resolve_format = r->resolve_endian = 0;
+        r->composed_child_serial = 0;
         return r;
       }
     }
@@ -1733,6 +1750,35 @@ class Deko3dCommandProcessor : public CommandProcessor {
     BindTargetSet(cmd, colors, depth);
   }
 
+  void ComposeAdjacentResolve(Frame& f, HostImage& parent) {
+    if (!parent.from_resolve || parent.resolve_frame != swaps_ || parent.resolve_pitch != parent.width ||
+        !parent.resolve_height || parent.resolve_height >= parent.height || (parent.resolve_height & 31) ||
+        MemoryChanged(parent, parent.guest_base, parent.mem_bytes)) return;
+    uint64_t child_base = uint64_t(parent.guest_base) + uint64_t(parent.resolve_pitch) * parent.resolve_height * 4;
+    if (child_base > UINT32_MAX) return;
+    auto it = guest_images_.find(uint32_t(child_base));
+    if (it == guest_images_.end()) return;
+    HostImage& child = *it->second;
+    if (!child.from_resolve || child.resolve_frame != swaps_ || child.resolve_pitch != parent.resolve_pitch ||
+        child.resolve_height != parent.height - parent.resolve_height || child.width != parent.width ||
+        child.height < child.resolve_height || child.format != parent.format || child.resolve_format != parent.resolve_format ||
+        child.resolve_endian != parent.resolve_endian || child.content_serial == parent.composed_child_serial ||
+        MemoryChanged(child, child.guest_base, child.mem_bytes)) return;
+    DkImageView sv, dv;
+    dkImageViewDefaults(&sv, &child.image);
+    dkImageViewDefaults(&dv, &parent.image);
+    DkImageRect sr{0, 0, 0, parent.width, child.resolve_height, 1};
+    DkImageRect dr{0, parent.resolve_height, 0, parent.width, child.resolve_height, 1};
+    dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
+    dkCmdBufCopyImage(f.cmdbuf, &sv, &sr, &dv, &dr, 0);
+    dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
+    parent.composed_child_serial = child.content_serial;
+    parent.mem_bytes = uint32_t(child_base - parent.guest_base) + child.mem_bytes;
+    parent.mem_hash = HashMemory(parent.guest_base, parent.mem_bytes);
+    LogOnce("resolveparts", "composed adjacent resolves %08X and %08X: %ux%u + %u rows",
+            parent.guest_base, child.guest_base, parent.width, parent.resolve_height, child.resolve_height);
+  }
+
   // The image at a guest address (resolve destinations, textures). A fetch or a swap asks for the
   // exact size (a resolve created it with the aligned height: resized once, contents copied); a
   // resolve asks for a minimum size (`at_least`) and creates with the aligned size (`create_w/h`).
@@ -1788,6 +1834,15 @@ class Deko3dCommandProcessor : public CommandProcessor {
       resized->from_resolve = img->from_resolve;
       resized->content_serial = img->content_serial;
       resized->checked_serial = img->checked_serial;
+      if (img->resolve_height && img->resolve_height < height) {
+        resized->mem_bytes = img->mem_bytes;
+        resized->mem_hash = img->mem_hash;
+      }
+      resized->resolve_pitch = img->resolve_pitch;
+      resized->resolve_height = img->resolve_height;
+      resized->resolve_frame = img->resolve_frame;
+      resized->resolve_format = img->resolve_format;
+      resized->resolve_endian = img->resolve_endian;
       resized->guest_base = base;
       Log("image at %08X resized %ux%u -> %ux%u", base, img->width, img->height, width, height);
       it->second = resized;
@@ -1831,6 +1886,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
                                img->from_resolve ? "was a resolve destination" : "was uploaded before", img->width, img->height);
     }
     img->from_resolve = false;
+    img->resolve_pitch = img->resolve_height = 0;
     img->content_serial = serial_;
     img->mem_bytes = src.bytes;
     img->mem_hash = HashMemory(base, img->mem_bytes);
@@ -2238,6 +2294,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (!dst) return true;
     dst->from_resolve = true;
     dst->content_serial = serial_;
+    dst->resolve_pitch = dst->resolve_height = dst->composed_child_serial = 0;
     dst->mem_bytes = dest_pitch * dest_height * 4;
     dst->mem_hash = HashMemory(info.copy_dest_base, dst->mem_bytes);
     if (x + w > src->width) w = x < src->width ? src->width - x : 0;
@@ -2251,6 +2308,13 @@ class Deko3dCommandProcessor : public CommandProcessor {
       DkImageRect sr{x, y, 0, w, h, 1}, dr{dx, dy, 0, w, h, 1};
       dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
       dkCmdBufCopyImage(cmd, &sv, &sr, &dv, &dr, 0);
+      if (!dx && !dy && w == dest_pitch && !(w & 31)) {
+        dst->resolve_pitch = dest_pitch;
+        dst->resolve_height = h;
+        dst->resolve_frame = swaps_;
+        dst->resolve_format = uint32_t(info.copy_dest_info.copy_dest_format);
+        dst->resolve_endian = uint32_t(info.copy_dest_info.copy_dest_endian);
+      }
       Checkpoint(f, "resolve EDRAM %u %ux%u rect %u,%u %ux%u -> %08X %ux%u at %u,%u", info.color_edram_info.base_tiles, src->width, src->height, x, y, w, h, info.copy_dest_base, dst->width, dst->height, dx, dy);
       dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
     }
