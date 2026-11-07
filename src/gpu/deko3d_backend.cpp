@@ -296,6 +296,15 @@ bool PrimitiveOf(xenos::PrimitiveType t, DkPrimitive& out, bool& rects) {
   }
 }
 
+bool SupportsPrimitiveReset(xenos::PrimitiveType t) {
+  switch (t) {
+    case xenos::PrimitiveType::kLineStrip: case xenos::PrimitiveType::kTriangleFan:
+    case xenos::PrimitiveType::kTriangleStrip: case xenos::PrimitiveType::kLineLoop:
+    case xenos::PrimitiveType::kQuadStrip: case xenos::PrimitiveType::kPolygon: return true;
+    default: return false;
+  }
+}
+
 bool VertexAttribOf(const ParsedVertexFetchInstruction::Attributes& a, DkVtxAttribSize& size, DkVtxAttribType& type) {
   using VF = xenos::VertexFormat;
   DkVtxAttribType norm = a.is_integer ? (a.is_signed ? DkVtxAttribType_Sscaled : DkVtxAttribType_Uscaled)
@@ -819,13 +828,25 @@ class Deko3dCommandProcessor : public CommandProcessor {
     uint32_t attrib_count = 0, buffer_count = 0;
     uint32_t vertex_count = index_count;
     uint32_t index_offset = UINT32_MAX;
+    uint32_t restart_index = regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx;
+    bool restart = index_buffer_info && su.multi_prim_ib_ena && SupportsPrimitiveReset(prim_type) &&
+                   (index_buffer_info->format != xenos::IndexFormat::kInt16 || restart_index <= UINT16_MAX);
     if (index_buffer_info) {
-      if (!CopyIndices(f, *index_buffer_info, index_offset, vertex_count)) { skipped_++; return true; }
+      uint32_t restart_hits = 0;
+      if (!CopyIndices(f, *index_buffer_info, restart, restart_index, index_offset, vertex_count, restart_hits)) { skipped_++; return true; }
+      if (restart_hits) LogOnce("primrestart", "primitive restart VS %016llX PS %016llX prim %u index %06X: %u of %u indices",
+                                (unsigned long long)vs->ucode_data_hash(), (unsigned long long)ps->ucode_data_hash(),
+                                uint32_t(prim_type), restart_index, restart_hits, index_buffer_info->count);
+      if (!vertex_count) { skipped_++; return true; }
     }
     for (const auto& vb : vs->vertex_bindings()) {
       if (buffer_count >= DK_MAX_VERTEX_BUFFERS) break;
       auto fetch = regs.GetVertexFetch(vb.fetch_constant);
       uint32_t stride = vb.stride_words * 4;
+      if (stride && vertex_count > UINT32_MAX / stride) {
+        LogOnce("vbsize", "vertex data size overflow: %u vertices x %u bytes", vertex_count, stride);
+        skipped_++; return true;
+      }
       uint32_t bytes = vertex_count * stride;
       uint32_t avail = fetch.size * 4;
       if (!stride) {
@@ -894,6 +915,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (!BindUniforms(f, vs, ps, vi, regs)) { skipped_++; return true; }
     phase(5);
 
+    dkCmdBufSetPrimitiveRestart(cmd, restart, restart_index);
     if (index_buffer_info) {
       dkCmdBufBindIdxBuffer(cmd, index_buffer_info->format == xenos::IndexFormat::kInt32 ? DkIdxFormat_Uint32 : DkIdxFormat_Uint16,
                             f.data.gpu + index_offset);
@@ -1971,31 +1993,46 @@ class Deko3dCommandProcessor : public CommandProcessor {
   }
 
   // ----- draws ----------------------------------------------------------------------------------
-  bool CopyIndices(Frame& f, const IndexBufferInfo& ib, uint32_t& offset_out, uint32_t& vertex_count_out) {
+  bool CopyIndices(Frame& f, const IndexBufferInfo& ib, bool restart, uint32_t restart_index,
+                   uint32_t& offset_out, uint32_t& vertex_count_out, uint32_t& restart_hits) {
+    const uint32_t index_size = ib.format == xenos::IndexFormat::kInt32 ? 4 : 2;
+    if (ib.length > UINT32_MAX || uint64_t(ib.count) * index_size > ib.length) {
+      LogOnce("indexrange", "invalid index buffer: %u indices, %zu bytes", ib.count, ib.length);
+      return false;
+    }
     uint32_t bytes = uint32_t(ib.length);
     uint32_t off = f.data.Alloc(bytes, 64);
     if (off == UINT32_MAX) { LogOnce("ring", "frame data ring full (indices)"); return false; }
     const uint8_t* src = memory_->TranslatePhysical(ib.guest_base);
     uint32_t max_index = 0;
+    bool has_vertex = false;
     if (ib.format == xenos::IndexFormat::kInt32) {
       const uint32_t* s = reinterpret_cast<const uint32_t*>(src);
       uint32_t* d = reinterpret_cast<uint32_t*>(f.data.cpu + off);
       for (uint32_t i = 0; i < ib.count; i++) {
         uint32_t v = xenos::GpuSwap(s[i], ib.endianness);
+        if (restart) v &= xenos::kVertexIndexMask;
         d[i] = v;
+        if (restart && v == restart_index) { restart_hits++; continue; }
+        has_vertex = true;
         if (v > max_index) max_index = v;
       }
     } else {
       const uint16_t* s = reinterpret_cast<const uint16_t*>(src);
       uint16_t* d = reinterpret_cast<uint16_t*>(f.data.cpu + off);
+      auto endian = ib.endianness == xenos::Endian::k8in32 ? xenos::Endian::k8in16 :
+                    ib.endianness == xenos::Endian::k16in32 ? xenos::Endian::kNone : ib.endianness;
       for (uint32_t i = 0; i < ib.count; i++) {
-        uint16_t v = xenos::GpuSwap(s[i], ib.endianness);
+        uint16_t v = xenos::GpuSwap(s[i], endian);
         d[i] = v;
+        if (restart && v == restart_index) { restart_hits++; continue; }
+        has_vertex = true;
         if (v > max_index) max_index = v;
       }
     }
     offset_out = off;
-    vertex_count_out = max_index + 1;
+    if (has_vertex && max_index == UINT32_MAX) { LogOnce("indexmax", "vertex index is too large"); return false; }
+    vertex_count_out = has_vertex ? max_index + 1 : 0;
     return true;
   }
 

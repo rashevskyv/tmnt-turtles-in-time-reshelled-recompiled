@@ -42,6 +42,7 @@ namespace {
   X(ClipControl, CLIPCONTROL) X(ColorMask, COLORMASK) X(DepthMask, DEPTHMASK) X(DepthFunc, DEPTHFUNC) \
   X(ColorMaski, COLORMASKI) X(Enablei, ENABLEI) X(Disablei, DISABLEI) \
   X(BlendFuncSeparatei, BLENDFUNCSEPARATEI) X(BlendEquationSeparatei, BLENDEQUATIONSEPARATEI) \
+  X(PrimitiveRestartIndex, PRIMITIVERESTARTINDEX) \
   X(BlendFuncSeparate, BLENDFUNCSEPARATE) X(BlendEquationSeparate, BLENDEQUATIONSEPARATE) \
   X(ClearBufferfv, CLEARBUFFERFV) X(ClearBufferfi, CLEARBUFFERFI) X(GenFramebuffers, GENFRAMEBUFFERS) \
   X(BindFramebuffer, BINDFRAMEBUFFER) X(FramebufferTexture2D, FRAMEBUFFERTEXTURE2D) X(DrawBuffers, DRAWBUFFERS) \
@@ -221,6 +222,8 @@ struct Exec {
   VtxBufBinding vtx[DK_MAX_VERTEX_BUFFERS] = {};
   DkIdxFormat idx_format = DkIdxFormat_Uint16;
   DkGpuAddr idx_addr = 0;
+  bool restart = false;
+  uint32_t restart_index = 0;
   DkResHandle tex[DK_NUM_TEXTURE_BINDINGS] = {};
   bool tex_bound[DK_NUM_TEXTURE_BINDINGS] = {};
   DkBufExtents ubo[2][DK_NUM_UNIFORM_BUFS] = {};  // [0] vertex, [1] fragment
@@ -656,6 +659,12 @@ void RunDraw(DkPrimitive prim, uint32_t count, uint32_t first, int32_t vertex_of
   (void)vertex_extent;
   bool quads;
   GLenum mode = PrimitiveOf(prim, quads);
+  if (indexed && E.restart && !quads) {
+    glEnable(GL_PRIMITIVE_RESTART);
+    glPrimitiveRestartIndex(E.restart_index);
+  } else {
+    glDisable(GL_PRIMITIVE_RESTART);
+  }
   if (quads) {
     // Quad list -> triangles (v0 v1 v2, v0 v2 v3 per quad), through an index buffer.
     std::vector<uint32_t> tri;
@@ -666,9 +675,14 @@ void RunDraw(DkPrimitive prim, uint32_t count, uint32_t first, int32_t vertex_of
                            : idx_size == 2 ? reinterpret_cast<const uint16_t*>(idx_ptr)[k] : reinterpret_cast<const uint8_t*>(idx_ptr)[k];
     };
     if (prim == DkPrimitive_QuadStrip) {
-      for (uint32_t q = 0; q + 3 < count; q += 2) {
-        uint32_t v0 = fetch(q), v1 = fetch(q + 1), v2 = fetch(q + 2), v3 = fetch(q + 3);
-        tri.insert(tri.end(), {v0, v1, v3, v0, v3, v2});
+      uint32_t start = 0;
+      for (uint32_t end = 0; end <= count; end++) {
+        if (end != count && !(indexed && E.restart && fetch(end) == E.restart_index)) continue;
+        for (uint32_t q = start; q + 3 < end; q += 2) {
+          uint32_t v0 = fetch(q), v1 = fetch(q + 1), v2 = fetch(q + 2), v3 = fetch(q + 3);
+          tri.insert(tri.end(), {v0, v1, v3, v0, v3, v2});
+        }
+        start = end + 1;
       }
     } else {
       for (uint32_t q = 0; q < quad_count; q++) {
@@ -853,6 +867,9 @@ void dkCmdBufBindVtxBuffers(DkCmdBuf c, uint32_t first, DkBufExtents const buffe
 }
 void dkCmdBufBindIdxBuffer(DkCmdBuf c, DkIdxFormat format, DkGpuAddr addr) {
   c->ops.push_back([=] { E.idx_format = format; E.idx_addr = addr; });
+}
+void dkCmdBufSetPrimitiveRestart(DkCmdBuf c, bool enable, uint32_t index) {
+  c->ops.push_back([=] { E.restart = enable; E.restart_index = index; });
 }
 
 void dkCmdBufSetViewports(DkCmdBuf c, uint32_t, DkViewport const v[], uint32_t) { DkViewport vp = v[0]; c->ops.push_back([=] { E.viewport = vp; }); }
