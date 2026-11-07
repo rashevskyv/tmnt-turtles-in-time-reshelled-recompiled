@@ -57,6 +57,9 @@ class Translator:
         self.has_loop = False
         self.has_kill = False
         self.uses_bools = False
+        self.uses_a0 = False
+        self.uses_cube = False
+        self.uses_lod = False
         self.stride_words = 0
         self.pending_serialize = False
         self.indent = '  '
@@ -102,14 +105,14 @@ class Translator:
 
     def parse_source(self, tok, count):
         """Source operand -> GLSL expression with exactly `count` components (1, 2 or 4)."""
-        m = re.match(r'^(-?)(r|c)(_abs)?(?:\[(\d+)\]|(\d+)|\[(\d+)\+aL\]|\[aL\])(?:\.([xyzw]+))?$', tok)
+        m = re.match(r'^(-?)(r|c)(_abs)?(?:\[(\d+)\]|(\d+)|\[(\d+)\+(?:aL|a0)\]|\[aL\]|\[a0\])(?:\.([xyzw]+))?$', tok)
         if not m:
             self.err('bad source operand %r' % tok)
         neg, kind, is_abs, idx_abs, idx_plain, idx_rel, swz = m.groups()
-        relative = tok.find('aL') >= 0  # gh: c[N+aL] inside a loop
+        relative = 'aL' if 'aL' in tok else 'a0' if 'a0' in tok else None  # gh: c[N+aL]; TMNT: c[N+a0] (maxas)
         idx = int(idx_abs if idx_abs is not None else idx_plain if idx_plain is not None else idx_rel or 0)
         if relative and kind != 'c':
-            self.err('aL on a register is not supported')
+            self.err('relative addressing of a register is not supported')
         if swz is None:
             swz = 'xyzw'
         if len(swz) == 1:
@@ -120,7 +123,8 @@ class Translator:
             self.reg_read(idx, swz[:count] if count in (1, 2) else swz[:4])
             base = 'r%d' % idx
         elif relative:
-            base = 'c[%d + aL]' % idx
+            base = 'c[%d + %s]' % (idx, relative)
+            self.uses_a0 = self.uses_a0 or relative == 'a0'
         else:
             base = 'c[%d]' % idx
         if count == 1:
@@ -208,25 +212,36 @@ class Translator:
         # Sources before the result: `tfetch2D r0, r0.xy` reads r0 (an interpolator) before writing it.
         coord = self.parse_source(parts[1], ncomp if ncomp != 3 else 4)
         target, comps = self.parse_result(parts[0])
+        if not parts[2].startswith('tf'):
+            self.err('tfetch without a fetch constant', rest)
+        slot = int(parts[2][2:])
         if ncomp == 3:
             coord = '(%s).xyz' % coord
+        if dim == 'Cube':
+            # The Xenos cube fetch takes (s, t, face) as the cube op makes them, not a direction.
+            self.uses_cube = True
+            coord = 'xe_cube_dir(%s)' % coord
         if dim == '1D':
             # The Xenos has no 1D textures: a 1D fetch reads a 2D texture of height 1 (Xenia does the
             # same), so the sampler is 2D and the row is 0.
             coord = 'vec2(%s, 0.5)' % coord
             dim = '2D'
-        if not parts[2].startswith('tf'):
-            self.err('tfetch without a fetch constant', rest)
-        slot = int(parts[2][2:])
         prev = self.textures.get(slot)
         if prev and prev != dim:
             self.err('texture slot %d used as %s and %s' % (slot, prev, dim))
         self.textures[slot] = dim
+        lod = None
         for p in parts[3:]:
             k = p.split('=')[0]
             if p == 'UnnormalizedTextureCoords=true':
                 # Texel coordinates (TMNT's full-screen copy, 894498C723463852: without it the frame stayed black).
                 coord = '(%s) / vec2(textureSize(tf_%d, 0))' % (coord, int(parts[2][2:]))
+            elif k in ('OffsetX', 'OffsetY') and dim == '2D':
+                # A texel offset (TMNT's shadow filter taps).
+                off = 'vec2(%s, 0.0)' if k == 'OffsetX' else 'vec2(0.0, %s)'
+                coord = '((%s) + %s / vec2(textureSize(tf_%d, 0)))' % (coord, off % p.split('=')[1], slot)
+            elif p == 'UseRegisterLOD=true':
+                lod = 'tex_lod'  # the level setTexLOD set (TMNT's cube reflections)
             elif k not in ('FetchValidOnly', 'UseComputedLOD', 'MagFilter', 'MinFilter', 'MipFilter', 'AnisoFilter'):
                 self.err('unsupported tfetch attribute %r' % p, rest)
         tmp = 'tex_%d' % self.tmp_counter()
@@ -236,7 +251,9 @@ class Translator:
         # filters on every texture seen, both forms pick the same texel; the compiled TEX differs in the LOD-mode field
         # only, and the console A/B (0.272) showed fewer blinking sprites with the computed LOD. Vertex fetches have no
         # derivatives: level 0.
-        if self.stage == 'frag':
+        if lod:
+            self.body.append('vec4 %s = textureLod(tf_%d, %s, %s);' % (tmp, slot, coord, lod))
+        elif self.stage == 'frag':
             self.body.append('vec4 %s = texture(tf_%d, %s);' % (tmp, slot, coord))
         else:
             self.body.append('vec4 %s = textureLod(tf_%d, %s, 0.0);' % (tmp, slot, coord))
@@ -281,6 +298,10 @@ class Translator:
             self.has_kill = True
             self.extra_kill = 'if (any(%s(%s, %s))) discard;' % (fn, a[0], a[1])
             return 'vec4(float(any(%s(%s, %s))))' % (fn, a[0], a[1])
+        if op == 'cube':
+            # (tc, sc, 2 * ma, face) of the direction (src1.y, src1.x, src1.z), D3D face order (Xenia's semantics).
+            self.uses_cube = True
+            return 'xe_cube(vec3((%s).y, (%s).x, (%s).z))' % (a[1], a[1], a[1])
         if op == 'dst':
             return 'vec4(1.0, (%s).y * (%s).y, (%s).z, (%s).w)' % (a[0], a[1], a[0], a[1])
         self.err('vector op %s is not implemented' % op)
@@ -331,6 +352,7 @@ class Translator:
             self.has_kill = True
             self.extra_kill = 'if (%s %s) discard;' % (a[0], cmp)
             return 'float(%s %s)' % (a[0], cmp)
+        if op == 'maxas': return 'max(%s, %s)' % (a[0], a[1])  # a0 is set in emit_alu
         if op == 'retain_prev': return 'ps'
         self.err('scalar op %s is not implemented' % op)
 
@@ -375,6 +397,8 @@ class Translator:
             stmts.append(self.extra_pred)
         if sres:
             stmts.append('ps = s%d;' % n)
+            if sca[0] == 'maxas':
+                stmts.append('a0 = int(clamp(floor(s%d + 0.5), -256.0, 255.0));' % n)
         if vres:
             stmts.extend(self.write_masked(vres[0], vres[1], 'v%d' % n, False))
         if sres:
@@ -438,13 +462,13 @@ class Translator:
                 text = m.group(3).split('//')[0].strip()
                 pred, text = self.strip_pred(text)
                 op = text.split()[0] if text else ''
-                if op in ('exec', 'exece'):
+                if op in ('exec', 'exece', 'cexec', 'cexece'):
                     cond = None
                     rest = text[len(op):].strip()
                     if rest.startswith('b') or rest.startswith('!b'):
                         self.uses_bools = True
                         cond = rest.split(',')[0].strip()
-                    cur = {'index': idx, 'kind': 'exec', 'end': op == 'exece', 'pred': pred, 'cond': cond}
+                    cur = {'index': idx, 'kind': 'exec', 'end': op.endswith('e'), 'pred': pred, 'cond': cond}
                 elif op == 'jmp' or op == 'cjmp':
                     self.has_jump = True
                     m2 = re.match(r'^c?jmp\s+(?:(!?b\d+),\s*)?L(\d+)$', text)
@@ -503,6 +527,22 @@ class Translator:
                 if not op.startswith('tfetch'):
                     self.err('texture instruction %s is not supported' % op, line)
                 self.emit_fetch_texture(op, body[len(op):].strip())
+            elif op == 'setTexLOD':
+                self.uses_lod = True
+                self.body.append('tex_lod = %s;' % self.parse_source(body.split()[1], 1))
+                continue
+            elif op == 'getWeights2D':
+                # The bilinear weights of the coordinate: fract(texel position - 0.5 + offset) (TMNT's shadow filter).
+                parts = [x.strip() for x in body[len(op):].split(',')]
+                coord = self.parse_source(parts[1], 2)
+                target, comps = self.parse_result(parts[0])
+                slot = int(parts[2][2:])
+                kv = dict(x.split('=', 1) for x in parts[3:])
+                tmp = 'w%d' % self.tmp_counter()
+                self.body.append('vec2 %s = fract((%s) * vec2(textureSize(tf_%d, 0)) - 0.5 + vec2(%s, %s));' % (
+                    tmp, coord, slot, kv.get('OffsetX', '0.0'), kv.get('OffsetY', '0.0')))
+                self.body.extend(self.write_masked(target, comps, 'vec4(%s, 0.0, 0.0)' % tmp, False))
+                continue
             if pred is not None and len(self.body) > start and (op in ('vfetch_full', 'vfetch_mini') or op.startswith('tfetch')):
                 inner = self.body[start:]
                 del self.body[start:]
@@ -549,7 +589,25 @@ class Translator:
         else:
             for k in colors:
                 out.append('layout(location = %d) out vec4 oC_%d;' % (k, k))
+        if self.uses_cube:
+            out.append('vec4 xe_cube(vec3 d) {')
+            out.append('  vec3 a = abs(d); float ma, sc, tc, face;')
+            out.append('  if (a.z >= a.x && a.z >= a.y) { ma = d.z; face = d.z < 0.0 ? 5.0 : 4.0; sc = d.z < 0.0 ? -d.x : d.x; tc = -d.y; }')
+            out.append('  else if (a.y >= a.x) { ma = d.y; face = d.y < 0.0 ? 3.0 : 2.0; sc = d.x; tc = d.y < 0.0 ? -d.z : d.z; }')
+            out.append('  else { ma = d.x; face = d.x < 0.0 ? 1.0 : 0.0; sc = d.x < 0.0 ? d.z : -d.z; tc = -d.y; }')
+            out.append('  return vec4(tc, sc, 2.0 * ma, face);')
+            out.append('}')
+            out.append('vec3 xe_cube_dir(vec3 c) {')
+            out.append('  float u = 2.0 * (c.x - 1.0) - 1.0, v = 2.0 * (c.y - 1.0) - 1.0; int f = int(c.z + 0.5);')
+            out.append('  if (f == 0) return vec3(1.0, -v, -u); if (f == 1) return vec3(-1.0, -v, u);')
+            out.append('  if (f == 2) return vec3(u, 1.0, v); if (f == 3) return vec3(u, -1.0, -v);')
+            out.append('  if (f == 4) return vec3(u, -v, 1.0); return vec3(-u, -v, -1.0);')
+            out.append('}')
         out.append('void main() {')
+        if self.uses_a0:
+            out.append(ind + 'int a0 = 0;')
+        if self.uses_lod:
+            out.append(ind + 'float tex_lod = 0.0;')
         for i in range(self.max_reg + 1):
             if self.stage == 'frag' and i in self.reads_before_write:
                 out.append(ind + 'vec4 r%d = i_%d;' % (i, i))
@@ -568,7 +626,7 @@ class Translator:
                 c = b['cond']
                 neg = c.startswith('!')
                 n = int(c.lstrip('!b'))
-                conds.append('%s((bools[%d][%d] >> %du) & 1u) != 0u' % ('!' if neg else '', n // 128, (n % 128) // 32, n % 32))
+                conds.append('%s(((bools[%d][%d] >> %du) & 1u) != 0u)' % ('!' if neg else '', n // 128, (n % 128) // 32, n % 32))
             return ' && '.join(conds)
 
         if self.has_loop:
