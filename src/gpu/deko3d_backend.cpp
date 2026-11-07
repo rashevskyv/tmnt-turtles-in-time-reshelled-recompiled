@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <thread>
 #include <cmath>
@@ -812,6 +813,33 @@ class Deko3dCommandProcessor : public CommandProcessor {
       uint32_t stride = vb.stride_words * 4;
       uint32_t bytes = vertex_count * stride;
       uint32_t avail = fetch.size * 4;
+      if (!stride) {
+        // A constant stream still needs one record, regardless of the vertex index.
+        uint32_t extent_words = 0;
+        for (const auto& a : vb.attributes) {
+          const auto& attributes = a.fetch_instr.attributes;
+          DkVtxAttribSize size;
+          DkVtxAttribType type;
+          if (!VertexAttribOf(attributes, size, type)) {
+            LogOnce("vfmt", "unsupported vertex format %u", uint32_t(attributes.data_format));
+            skipped_++; return true;
+          }
+          if (attributes.offset < 0 || attributes.offset > 0x3FFF / 4) {
+            LogOnce("vbzero-offset", "zero-stride vertex fetch %u has invalid offset %d words",
+                    vb.fetch_constant, attributes.offset);
+            skipped_++; return true;
+          }
+          const uint32_t words = xenos::GetVertexFormatNeededWords(attributes.data_format, 0b1111);
+          if (!words) { skipped_++; return true; }
+          extent_words = std::max(extent_words, uint32_t(attributes.offset) + uint32_t(std::bit_width(words)));
+        }
+        if (!extent_words || extent_words > fetch.size) {
+          LogOnce("vbzero", "zero-stride vertex fetch %u has invalid extent %u words (available %u)", vb.fetch_constant,
+                  extent_words, fetch.size);
+          skipped_++; return true;
+        }
+        bytes = extent_words * 4;
+      }
       if (bytes > avail) {
         LogOnce("vbclamp", "vertex data clamped: %u vertices x %u bytes = %u, fetch constant %u holds %u bytes (VS %016llX)", vertex_count,
                 stride, bytes, vb.fetch_constant, avail, (unsigned long long)vs->ucode_data_hash());
