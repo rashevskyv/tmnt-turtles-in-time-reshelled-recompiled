@@ -34,12 +34,13 @@ bool g_logged = false;
 
 extern "C" void rex_nx_patch_file_read(const char* name, uint8_t* data, uint64_t file_offset, size_t length) {
   (void)file_offset;
-  static int names_logged = 0;  // console 0.56 logged no swap: which files come through here
-  if (name && names_logged < 4 && (names_logged == 0 || file_offset == 0)) {
-    names_logged++;
+  // Console 0.56 and 0.57 logged no swap: which reads come through here (each file once at its first read, and
+  // the first 24 reads of TMNT.bf).
+  static int names_logged = 0, bf_logged = 0;
+  const bool bf = name && !strcasecmp(name, "TMNT.bf");
+  if (name && ((bf && bf_logged++ < 24) || (!bf && file_offset == 0 && names_logged++ < 64)))
     std::printf("[nx] glyphs: read of %s at %llu, %zu bytes\n", name, (unsigned long long)file_offset, length);
-  }
-  if (!name || strcasecmp(name, "TMNT.bf") || !rex_nx_setting_button_icons() || length < 12) return;
+  if (!bf || !rex_nx_setting_button_icons() || length < 12) return;
   // ponytail: an entry cut by the edge of a read stays as it is; the game reads the .feu files whole.
   int swapped = 0;
   for (size_t i = 4; i + 8 <= length; i++) {  // the entries are not 4-byte aligned in the archive
