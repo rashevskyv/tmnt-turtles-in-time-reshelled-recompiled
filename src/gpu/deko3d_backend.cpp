@@ -909,6 +909,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
         std::printf("[nx] gpu: swap #%u%s\n", swaps_, " (skipped)");  // the Eden gate's counter
         ReadFpsMode();
       }
+      NextFrame(false);
       return;
     }
     Frame& f = frames_[frame_];
@@ -1146,36 +1147,40 @@ class Deko3dCommandProcessor : public CommandProcessor {
     frame_big_tex_ = false;
     frame_mip_only_ = false;
     frame_ = (frame_ + 1) % kFrames;
-    BeginFrame();
+    begun_ = false;
+    NextFrame(true);
   }
 
  private:
-  // The frame-rate mode, file sdmc:/switch/tmnt/fps (next to the shader dir), read at start and every 60 swaps, so it
-  // switches during a run (the user's A/B needs no build): no file or "60" = every frame drawn, presented at the next
-  // vblank; "30" = every frame drawn, presented every second vblank (the swapchain acquire paces the guest at 30 Hz);
-  // The game is time-based (Eden 0.237: 96-99% of real time at 30 and 60), so "30" is the even mode. The "30skip" mode
-  // (every second frame not drawn) was removed on 2026-11-05: on the console it showed ~20 fps (user's report).
+  // Whether the next frame is drawn (hcu-switch's 30skip). 60: every frame. 30: not the frame after a drawn one, and not
+  // one the GPU has no free frame slot for yet (its fence is still pending) instead of waiting: the guest keeps its 60
+  // frames a second (the command processor still runs every packet: fences, write-backs, the guest's waits), the game
+  // keeps its speed, every second frame is shown.
+  void NextFrame(bool drawn) {
+    skip_frame_ = false;
+    if (skip_odd_ && drawn) {
+      skip_frame_ = true;
+    } else if (skip_odd_ && frames_[frame_].fenced && dkFenceWait(&frames_[frame_].fence, 0) != DkResult_Success) {
+      skip_frame_ = true;
+      busy_skips_++;
+    }
+    if (!skip_frame_ && !begun_) {
+      BeginFrame();
+      begun_ = true;
+    }
+  }
+
+  // The frame-rate mode (the settings menu, nx_menu.cpp; read at start and every 60 swaps, so it switches during a run).
+  // "60" = every frame drawn. "30" = hcu-switch's 30skip (NextFrame): the guest keeps 60 frames a second, every second
+  // one is drawn. TMNT counts frames for its game time: a 30 Hz present or 30 Hz vblanks (Castlevania's "30", console
+  // 0.50) ran it at half speed.
   void ReadFpsMode() {
     if (!debug_dir_.empty() && unlink((debug_dir_ + "record_now").c_str()) == 0) rex_nx_debug_record_set(1);
-    // The settings menu (nx_menu.cpp, settings.txt; the old marker file sdmc:/switch/tmnt/fps is imported
-    // once when there is no settings file yet).
-    const int mode = rex_nx_setting_fps_mode();
-    const uint32_t interval = mode == 1 ? 2 : 1;
-    // Mode 30 also halves the guest's vblank interrupt rate (the SDK's vsync worker, sdk-edits rule 31): the game
-    // starts its frames at a vblank and times them by mftb, so with 60 Hz vblanks under a 30 Hz present its frames
-    // alternated 17 / 50 ms (console 0.249: 5-8 frames of 50 ms per second with the presents even) = uneven
-    // motion. That was Castlevania. TMNT counts vblanks for its game time: at 30 Hz vblanks the menu ran at half
-    // speed (console 0.50), so the vblanks stay at 60 Hz; the file sdmc:/switch/tmnt/vblank30 halves them for an A/B.
-    const bool vblank60 = access((debug_dir_ + "vblank30").c_str(), F_OK) != 0;
-    const int divider = interval == 2 && !vblank60 ? 2 : 1;
-    if (interval == swap_interval_ && divider == rex_nx_vblank_divider && swaps_) return;
-    swap_interval_ = interval;
-    rex_nx_vblank_divider = divider;
-#ifndef TMNT_DK_GL
-    dkSwapchainSetSwapInterval(swapchain_, interval);
-#endif
-    std::printf("[nx] gpu: fps mode %s: swap interval %u, vblank interrupts at %u Hz from swap #%u\n",
-                interval == 2 ? "30" : "60", interval, 60u / divider, swaps_);
+    const bool skip = rex_nx_setting_fps_mode() == 1;
+    if (skip == skip_odd_ && swaps_) return;
+    skip_odd_ = skip;
+    std::printf("[nx] gpu: fps mode %s from swap #%u (%u frames skipped for a busy GPU so far)\n", skip ? "30 (every second frame drawn)" : "60",
+                swaps_, busy_skips_);
     std::fflush(stdout);
   }
 
@@ -1184,6 +1189,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   // The file <TMNT_DK_DUMP_DIR>/skip_on does the same while it exists (checked every 8 swaps): fast forward
   // through loading screens, then delete it.
   bool Skipping() const {
+    if (skip_frame_) return true;  // the 30 mode (NextFrame)
 #ifdef TMNT_DK_GL
     static const uint32_t start = std::getenv("TMNT_DK_START_SWAP") ? uint32_t(std::atoi(std::getenv("TMNT_DK_START_SWAP"))) : 0;
     static const char* dir = std::getenv("TMNT_DK_DUMP_DIR");
@@ -2096,7 +2102,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
     f.rec_us = us;
   }
 #endif
-  uint32_t swap_interval_ = 1;    // ReadFpsMode: vblanks per presented frame
+  bool skip_odd_ = false;   // ReadFpsMode: the 30 mode
+  bool skip_frame_ = false; // this frame is not drawn (NextFrame)
+  bool begun_ = true;       // frames_[frame_] is ready for recording (BeginFrame ran)
+  uint32_t busy_skips_ = 0;
   double shown_last_ms_ = 0;      // the last present (the shown-frame intervals of the dk time/s line)
   std::vector<double> shown_ms_;
   bool dump_images_ = false;
