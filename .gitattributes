@@ -20,4 +20,4 @@ tools/xenos2glsl.py text eol=lf
 tools/nro_nacp.py text eol=lf
 tools/dlc_modules.py text eol=lf
 tools/module_keep_symbols.py text eol=lf
-tools/stfs_icon.py text eol=lf
+tools/game_icon.py text eol=lf

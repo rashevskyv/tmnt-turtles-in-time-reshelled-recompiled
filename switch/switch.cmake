@@ -99,7 +99,7 @@ target_link_options(tmnt PRIVATE
 target_link_libraries(tmnt PRIVATE "${NVK_SDK}/lib/libvulkan.a" deko3d lz4 zstd expat z nx m stdc++)
 # nx_create_nro ignores NAME/AUTHOR/VERSION: the NACP is generated here and handed to it.
 nx_generate_nacp(tmnt.nacp NAME "TMNT Re-Shelled" AUTHOR "tmnt-recomp" VERSION "${TMNT_VERSION}")
-# The hbmenu icon: the title thumbnail from the player's own XBLA package (tools/stfs_icon.py, switch/build.sh).
+# The hbmenu icon: the logo and title thumbnail from the player's own game files (tools/game_icon.py, switch/build.sh).
 # Game art: it stays outside git and lives only inside the NRO; without it the devkitPro default icon.
 set(TMNT_ICON "" CACHE FILEPATH "256x256 JPEG NRO icon (outside git)")
 if(TMNT_ICON AND EXISTS "${TMNT_ICON}")

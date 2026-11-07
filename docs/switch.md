@@ -27,7 +27,7 @@ The build runs in WSL or Linux with devkitPro (devkitA64, libnx, deko3d, uam) an
 2. Your package's files in `$TMNT_ROOT/src/game/extracted`.
 3. `switch/build.sh` copies the checkout to `$TMNT_ROOT/src`, applies `switch/sdk-edits.py` and
    `switch/sdk-edits-tmnt.py` to the SDK, runs codegen and builds `tmnt.nro` plus `stage/` (the NRO, the
-   shaders as DKSH). `TMNT_PACKAGE=<your package>` puts its title image on the hbmenu icon (kept outside git).
+   shaders as DKSH). The hbmenu icon is made from your `banner.png` and `title_icon.png` (kept outside git).
 4. `switch/deploy.sh push` copies the stage to the console over FTP; every file is read back and checked by SHA-1.
 
 ## How it is put together

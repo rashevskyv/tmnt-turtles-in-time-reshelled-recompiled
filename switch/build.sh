@@ -66,10 +66,10 @@ else
     rm -f "$BUILD/tmnt_version.h.new"
 fi
 echo "version $VERSION, built $STAMP"
-# NRO icon: the title thumbnail of the player's XBLA package ($TMNT_PACKAGE), game art kept outside git.
+# NRO icon from the player's game files (banner.png, title_icon.png), game art kept outside git.
 ICON=$ROOT/icon/tmnt_icon_256.jpg
-PKG=${TMNT_PACKAGE:-}
-[ -f "$ICON" ] || [ -z "$PKG" ] || { mkdir -p "$ROOT/icon"; python3 "$SRC/tools/stfs_icon.py" "$PKG" "$ICON"; }
+mkdir -p "$ROOT/icon"
+python3 "$SRC/tools/game_icon.py" "$SRC/game/extracted" "$ICON" || rm -f "$ICON"
 
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
