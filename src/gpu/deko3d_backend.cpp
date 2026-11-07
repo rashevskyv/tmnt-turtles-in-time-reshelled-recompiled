@@ -587,7 +587,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (!vs || !ps) { skipped_++; return true; }
     auto mask = regs.Get<reg::RB_COLOR_MASK>();
     auto dc = draw_util::GetNormalizedDepthControl(regs);
-    bool writes_color = mask.write_red0 || mask.write_green0 || mask.write_blue0 || mask.write_alpha0;
+    const uint32_t color_mask = draw_util::GetNormalizedColorMask(regs, ps->writes_color_targets());
+    bool writes_color = color_mask != 0;
     bool writes_depth = dc.z_enable && dc.z_write_enable;
     if (!writes_color && !writes_depth && !dc.stencil_enable) { skipped_++; return true; }
     if (IsClearDraw(vs, ps, prim_type)) return ClearDraw(index_count, mode);
@@ -602,11 +603,16 @@ class Deko3dCommandProcessor : public CommandProcessor {
       // Each shader pair's first draw, once: the state a new kind of draw comes with.
       auto blend = regs.Get<reg::RB_BLENDCONTROL>();
       {
-        Log("draw VS %016llX PS %016llX: prim %u n=%u%s, blend %u/%u op %u, mask %x, z %u/%u func %u, cull f%u b%u face %u, %zu vfetch %zu tfetch",
+        Log("draw VS %016llX PS %016llX: prim %u n=%u%s, blend %u/%u op %u, mask %04x shader targets %x, z %u/%u func %u, cull f%u b%u face %u, %zu vfetch %zu tfetch",
                 (unsigned long long)vs->ucode_data_hash(), (unsigned long long)ps->ucode_data_hash(), uint32_t(prim_type), index_count,
                 index_buffer_info ? " indexed" : "", uint32_t(blend.color_srcblend), uint32_t(blend.color_destblend),
-                uint32_t(blend.color_comb_fcn), regs.values[XE_GPU_REG_RB_COLOR_MASK] & 0xF, dc.z_enable, dc.z_write_enable,
+                uint32_t(blend.color_comb_fcn), mask.value & 0xFFFF, ps->writes_color_targets(), dc.z_enable, dc.z_write_enable,
                 uint32_t(dc.zfunc), regs.Get<reg::PA_SU_SC_MODE_CNTL>().cull_front, regs.Get<reg::PA_SU_SC_MODE_CNTL>().cull_back, regs.Get<reg::PA_SU_SC_MODE_CNTL>().face, vs->vertex_bindings().size(), ps->texture_bindings().size());
+        for (uint32_t i = 0; i < 4; i++) {
+          if (!((color_mask >> (i * 4)) & 0xF)) continue;
+          auto ci = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+          Log("  rt%u base %u format %u mask %x", i, ci.color_base, uint32_t(ci.color_format), (color_mask >> (i * 4)) & 0xF);
+        }
         // Its vertex layout and the first vertices (byte-swapped words as hex and as floats).
         for (const auto& vb : vs->vertex_bindings()) {
           auto fetch = regs.GetVertexFetch(vb.fetch_constant);
@@ -720,15 +726,22 @@ class Deko3dCommandProcessor : public CommandProcessor {
 
     // Render targets.
     auto surf = regs.Get<reg::RB_SURFACE_INFO>();
-    auto color_info = regs.Get<reg::RB_COLOR_INFO>();
     auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
     uint32_t pitch = EffectivePitch(surf);
-    HostImage* color = (mode != xenos::EdramMode::kDepthOnly && writes_color)
-                           ? TargetImage(color_info.color_base, pitch, ColorTargetFormatOf(color_info.color_format), false)
-                           : nullptr;
+    HostImage* colors[4] = {};
+    HostImage* color = nullptr;
+    if (mode != xenos::EdramMode::kDepthOnly) {
+      for (uint32_t i = 0; i < 4; i++) {
+        if (!((color_mask >> (i * 4)) & 0xF)) continue;
+        auto ci = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+        colors[i] = TargetImage(ci.color_base, pitch, ColorTargetFormatOf(ci.color_format), false);
+        if (!colors[i]) { skipped_++; return true; }
+        if (!color) color = colors[i];
+      }
+    }
     HostImage* depth = (dc.z_enable || dc.stencil_enable) ? TargetImage(depth_info.depth_base, pitch, DkImageFormat_Z24S8, true) : nullptr;
     if (!color && !depth) { skipped_++; return true; }
-    BindTargets(cmd, color, depth);
+    if (!BindTargetSet(cmd, colors, depth)) { skipped_++; return true; }
     uint32_t target_w = color ? color->width : depth->width;
     uint32_t target_h = color ? color->height : depth->height;
 
@@ -768,22 +781,24 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     rs.fillRectangleEnable = rects && !use_gs;
     dkCmdBufBindRasterizerState(cmd, &rs);
-    auto blend = regs.Get<reg::RB_BLENDCONTROL>();
-    bool blend_enabled = !(blend.color_srcblend == xenos::BlendFactor::kOne && blend.color_destblend == xenos::BlendFactor::kZero &&
-                           blend.color_comb_fcn == xenos::BlendOp::kAdd && blend.alpha_srcblend == xenos::BlendFactor::kOne &&
-                           blend.alpha_destblend == xenos::BlendFactor::kZero && blend.alpha_comb_fcn == xenos::BlendOp::kAdd);
     DkColorState cs;
     dkColorStateDefaults(&cs);
-    cs.blendEnableMask = blend_enabled ? 1 : 0;
-    dkCmdBufBindColorState(cmd, &cs);
     DkColorWriteState cw;
     dkColorWriteStateDefaults(&cw);
-    cw.masks = (mask.write_red0 ? DkColorMask_R : 0) | (mask.write_green0 ? DkColorMask_G : 0) |
-               (mask.write_blue0 ? DkColorMask_B : 0) | (mask.write_alpha0 ? DkColorMask_A : 0);
+    cw.masks = mode == xenos::EdramMode::kDepthOnly ? 0 : color_mask;
+    DkBlendState bs[4];
+    for (uint32_t i = 0; i < 4; i++) {
+      auto b = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+      bool enabled = !(b.color_srcblend == xenos::BlendFactor::kOne && b.color_destblend == xenos::BlendFactor::kZero &&
+                       b.color_comb_fcn == xenos::BlendOp::kAdd && b.alpha_srcblend == xenos::BlendFactor::kOne &&
+                       b.alpha_destblend == xenos::BlendFactor::kZero && b.alpha_comb_fcn == xenos::BlendOp::kAdd);
+      if (enabled) cs.blendEnableMask |= 1u << i;
+      bs[i] = DkBlendState{BlendOp(b.color_comb_fcn), BlendFactor(b.color_srcblend), BlendFactor(b.color_destblend),
+                           BlendOp(b.alpha_comb_fcn), BlendFactor(b.alpha_srcblend), BlendFactor(b.alpha_destblend)};
+    }
+    dkCmdBufBindColorState(cmd, &cs);
     dkCmdBufBindColorWriteState(cmd, &cw);
-    DkBlendState bs{BlendOp(blend.color_comb_fcn), BlendFactor(blend.color_srcblend), BlendFactor(blend.color_destblend),
-                    BlendOp(blend.alpha_comb_fcn), BlendFactor(blend.alpha_srcblend), BlendFactor(blend.alpha_destblend)};
-    dkCmdBufBindBlendStates(cmd, 0, &bs, 1);
+    dkCmdBufBindBlendStates(cmd, 0, bs, 4);
     DkDepthStencilState ds;
     dkDepthStencilStateDefaults(&ds);
     ds.depthTestEnable = depth && dc.z_enable;
@@ -888,7 +903,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     Checkpoint(f, "draw VS %016llX PS %016llX n=%u target=%ux%u first_texture=%08X %ux%u",
                (unsigned long long)vs->ucode_data_hash(), (unsigned long long)ps->ucode_data_hash(), index_count,
-               bound_color_ ? bound_color_->width : 0, bound_color_ ? bound_color_->height : 0,
+               color ? color->width : 0, color ? color->height : 0,
                tcount ? tnames[0].base : 0, tcount ? tnames[0].w : 0, tcount ? tnames[0].h : 0);
     if (trace_enabled_ && !traced_) {
       // One line per draw of a gameplay frame (file sdmc:/switch/tmnt/dk_trace): what the HP/MP bar and the
@@ -1439,7 +1454,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (gpu_checkpoints_) std::memset(f.checkpoint_data.cpu, 0, kMaxCheckpoints * 16);
     dkCmdBufBindImageDescriptorSet(f.cmdbuf, descriptors_.gpu + f.desc_offset, kMaxImageDescriptors);
     dkCmdBufBindSamplerDescriptorSet(f.cmdbuf, descriptors_.gpu + sampler_desc_offset_, kSamplerCount);
-    bound_color_ = nullptr;
+    std::fill(std::begin(bound_colors_), std::end(bound_colors_), nullptr);
     bound_depth_ = nullptr;
     f.vs_uni = f.ps_uni = f.sys_uni = UINT32_MAX;
     f.vs_uni_shader = f.ps_uni_shader = nullptr;
@@ -1649,16 +1664,50 @@ class Deko3dCommandProcessor : public CommandProcessor {
     return img;
   }
 
-  void BindTargets(DkCmdBuf cmd, HostImage* color, HostImage* depth) {
-    if (color == bound_color_ && depth == bound_depth_) return;
+  bool BindTargetSet(DkCmdBuf cmd, HostImage* const requested[4], HostImage* depth) {
+    HostImage* colors[4] = {requested[0], requested[1], requested[2], requested[3]};
+    uint32_t count = 0;
+    HostImage* size_ref = nullptr;
+    for (uint32_t i = 0; i < 4; i++) {
+      if (!colors[i]) continue;
+      count = i + 1;
+      size_ref = colors[i];
+      for (uint32_t j = 0; j < i; j++) {
+        if (colors[i] == colors[j]) {
+          LogOnce("mrtalias", "overlapping MRT slots %u and %u skipped", j, i);
+          return false;
+        }
+      }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+      if (colors[i]) continue;
+      uint64_t key = (uint64_t(size_ref->width) << 32) | (uint64_t(size_ref->height) << 2) | i;
+      auto it = dummy_targets_.find(key);
+      if (it == dummy_targets_.end()) {
+        HostImage* dummy = CreateImage(size_ref->width, size_ref->height, DkImageFormat_RGBA8_Unorm, DkImageFlags_UsageRender, false);
+        if (!dummy) return false;
+        it = dummy_targets_.emplace(key, dummy).first;
+      }
+      colors[i] = it->second;
+    }
+    if (std::equal(std::begin(colors), std::end(colors), std::begin(bound_colors_)) && depth == bound_depth_) return true;
     dkCmdBufBarrier(cmd, DkBarrier_Fragments, 0);
-    DkImageView cv, dv;
-    DkImageView const* colors[1] = {&cv};
-    if (color) dkImageViewDefaults(&cv, &color->image);
+    DkImageView cv[4], dv;
+    DkImageView const* views[4];
+    for (uint32_t i = 0; i < count; i++) {
+      dkImageViewDefaults(&cv[i], &colors[i]->image);
+      views[i] = &cv[i];
+    }
     if (depth) dkImageViewDefaults(&dv, &depth->image);
-    dkCmdBufBindRenderTargets(cmd, color ? colors : nullptr, color ? 1 : 0, depth ? &dv : nullptr);
-    bound_color_ = color;
+    dkCmdBufBindRenderTargets(cmd, views, count, depth ? &dv : nullptr);
+    std::copy(std::begin(colors), std::end(colors), std::begin(bound_colors_));
     bound_depth_ = depth;
+    return true;
+  }
+
+  void BindTargets(DkCmdBuf cmd, HostImage* color, HostImage* depth) {
+    HostImage* colors[4] = {color, nullptr, nullptr, nullptr};
+    BindTargetSet(cmd, colors, depth);
   }
 
   // The image at a guest address (resolve destinations, textures). A fetch or a swap asks for the
@@ -2027,7 +2076,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   // The XDK's Clear: rectangles (position xyz + color rgba, stride 7 words) with the depth
   // function "always"; half of them through the 2x MSAA half-pitch alias of the surface.
   bool IsClearDraw(DkShaderObj* vs, DkShaderObj* ps, xenos::PrimitiveType prim) {
-    if (prim != xenos::PrimitiveType::kRectangleList || !ps->texture_bindings().empty()) return false;
+    if (prim != xenos::PrimitiveType::kRectangleList || !ps->texture_bindings().empty() || (ps->writes_color_targets() & ~1u)) return false;
     const auto& vbs = vs->vertex_bindings();
     if (vbs.size() != 1 || vbs[0].stride_words != 7 || vbs[0].attributes.size() != 2) return false;
     const auto& a0 = vbs[0].attributes[0].fetch_instr.attributes;
@@ -2112,11 +2161,31 @@ class Deko3dCommandProcessor : public CommandProcessor {
       LogOnce("depthresolve", "depth resolve to %08X ignored", info.copy_dest_base);
       return true;
     }
+    if (info.color_edram_info.format_is_64bpp) {
+      LogOnce("resolve64", "64-bit color resolve and clear at EDRAM %u are unsupported", info.color_edram_info.base_tiles);
+      return true;
+    }
     uint32_t src_pitch = info.color_edram_info.pitch_tiles * 80;
     HostImage* src = TargetImage(info.color_edram_info.base_tiles, src_pitch, DkImageFormat_RGBA8_Unorm, false);
     if (!src) return true;
     uint32_t x = info.coordinate_info.edram_offset_x_div_8 * 8, y = info.coordinate_info.edram_offset_y_div_8 * 8;
     uint32_t w = info.coordinate_info.width_div_8 * 8, h = info.height_div_8 * 8;
+    auto src_format = xenos::ColorRenderTargetFormat(info.color_edram_info.format);
+    if (src->format != DkImageFormat_RGBA8_Unorm && src->format != DkImageFormat_RGBA8_Unorm_sRGB) {
+      LogOnce("resolvefmt", "color resolve EDRAM %u format %u to format %u is unsupported", info.color_edram_info.base_tiles,
+              uint32_t(src_format), uint32_t(info.copy_dest_info.copy_dest_format));
+      if (info.IsClearingColor()) {
+        BindTargets(cmd, src, nullptr);
+        DkScissor sc{x, y, x < src->width ? std::min(w, src->width - x) : 0,
+                     y < src->height ? std::min(h, src->height - y) : 0};
+        dkCmdBufSetScissors(cmd, 0, &sc, 1);
+        uint32_t c = info.rb_color_clear;
+        float clear[4] = {((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
+                          (c & 0xFF) / 255.0f, ((c >> 24) & 0xFF) / 255.0f};
+        dkCmdBufClearColor(cmd, 0, DkColorMask_RGBA, clear);
+      }
+      return true;
+    }
     uint32_t dest_pitch = info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32;
     uint32_t dest_height = info.copy_dest_coordinate_info.height_aligned_div_32 * 32;
     (void)dest_pitch; (void)dest_height;
@@ -2337,7 +2406,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
   std::unordered_map<uint64_t, DkShaderObj*> shaders_;
   std::unordered_map<uint64_t, HostImage*> targets_;       // EDRAM base/pitch -> render target
   std::unordered_map<uint32_t, HostImage*> guest_images_;  // guest address -> texture / resolve destination
-  HostImage* bound_color_ = nullptr;
+  HostImage* bound_colors_[4] = {};
+  std::unordered_map<uint64_t, HostImage*> dummy_targets_;
   HostImage* bound_depth_ = nullptr;
   std::unordered_set<std::string> logged_;
   std::unordered_set<uint64_t> seen_;

@@ -18,6 +18,7 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -39,6 +40,8 @@ namespace {
 #define GL_FUNCS(X) \
   X(Viewport, VIEWPORT) X(Scissor, SCISSOR) X(Enable, ENABLE) X(Disable, DISABLE) X(DepthRangef, DEPTHRANGEF) \
   X(ClipControl, CLIPCONTROL) X(ColorMask, COLORMASK) X(DepthMask, DEPTHMASK) X(DepthFunc, DEPTHFUNC) \
+  X(ColorMaski, COLORMASKI) X(Enablei, ENABLEI) X(Disablei, DISABLEI) \
+  X(BlendFuncSeparatei, BLENDFUNCSEPARATEI) X(BlendEquationSeparatei, BLENDEQUATIONSEPARATEI) \
   X(BlendFuncSeparate, BLENDFUNCSEPARATE) X(BlendEquationSeparate, BLENDEQUATIONSEPARATE) \
   X(ClearBufferfv, CLEARBUFFERFV) X(ClearBufferfi, CLEARBUFFERFI) X(GenFramebuffers, GENFRAMEBUFFERS) \
   X(BindFramebuffer, BINDFRAMEBUFFER) X(FramebufferTexture2D, FRAMEBUFFERTEXTURE2D) X(DrawBuffers, DRAWBUFFERS) \
@@ -203,14 +206,14 @@ struct VtxBufBinding {
   uint32_t size = 0;
 };
 struct Exec {
-  const ImageData* color = nullptr;
+  std::array<const ImageData*, 4> color{};
   const ImageData* depth = nullptr;
   DkViewport viewport{0, 0, 1, 1, 0, 1};
   DkScissor scissor{0, 0, 1, 1};
   DkRasterizerState rast{};
   DkColorState colorstate{};
   DkColorWriteState colorwrite{};
-  DkBlendState blend{};
+  std::array<DkBlendState, 4> blend{};
   DkDepthStencilState ds{};
   const DkShader* shaders[5] = {};  // by stage: vertex, tess ctrl, tess eval, geometry, fragment
   std::vector<DkVtxAttribState> attribs;
@@ -449,16 +452,20 @@ GLuint ProgramFor(const ShaderData* vs, const ShaderData* gs, const ShaderData* 
   return prog;
 }
 
-void BindFramebuffer(const ImageData* color, const ImageData* depth) {
+void BindFramebuffer(const std::array<const ImageData*, 4>& colors, const ImageData* depth) {
   glBindFramebuffer(GL_FRAMEBUFFER, G.fbo);
-  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color ? color->tex : 0, 0);
+  GLenum draws[4];
+  for (uint32_t i = 0; i < 4; i++) {
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, colors[i] ? colors[i]->tex : 0, 0);
+    draws[i] = colors[i] ? GL_COLOR_ATTACHMENT0 + i : GL_NONE;
+  }
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, depth ? depth->tex : 0, 0);
-  GLenum draw = color ? GL_COLOR_ATTACHMENT0 : GL_NONE;
-  glDrawBuffers(1, &draw);
+  glDrawBuffers(4, draws);
 }
 
 void ApplyScissorViewport() {
-  const ImageData* t = E.color ? E.color : E.depth;
+  const ImageData* t = E.depth;
+  for (auto* color : E.color) if (color) { t = color; break; }
   glEnable(GL_SCISSOR_TEST);
   DkScissor s = E.scissor;
   if (t) {
@@ -474,15 +481,18 @@ void ApplyScissorViewport() {
 }
 
 void ApplyFixedState() {
-  uint32_t m = E.colorwrite.masks;
-  glColorMask(m & DkColorMask_R, (m & DkColorMask_G) != 0, (m & DkColorMask_B) != 0, (m & DkColorMask_A) != 0);
-  if (E.colorstate.blendEnableMask & 1) {
-    glEnable(GL_BLEND);
-    glBlendEquationSeparate(BlendEq(E.blend.colorBlendOp), BlendEq(E.blend.alphaBlendOp));
-    glBlendFuncSeparate(BlendFactorOf(E.blend.srcColorBlendFactor), BlendFactorOf(E.blend.dstColorBlendFactor),
-                        BlendFactorOf(E.blend.srcAlphaBlendFactor), BlendFactorOf(E.blend.dstAlphaBlendFactor));
-  } else {
-    glDisable(GL_BLEND);
+  for (uint32_t i = 0; i < 4; i++) {
+    uint32_t m = E.colorwrite.masks >> (i * 4);
+    glColorMaski(i, (m & DkColorMask_R) != 0, (m & DkColorMask_G) != 0, (m & DkColorMask_B) != 0, (m & DkColorMask_A) != 0);
+    if (E.colorstate.blendEnableMask & (1u << i)) {
+      glEnablei(GL_BLEND, i);
+      const auto& b = E.blend[i];
+      glBlendEquationSeparatei(i, BlendEq(b.colorBlendOp), BlendEq(b.alphaBlendOp));
+      glBlendFuncSeparatei(i, BlendFactorOf(b.srcColorBlendFactor), BlendFactorOf(b.dstColorBlendFactor),
+                           BlendFactorOf(b.srcAlphaBlendFactor), BlendFactorOf(b.dstAlphaBlendFactor));
+    } else {
+      glDisablei(GL_BLEND, i);
+    }
   }
   if (E.ds.depthTestEnable && E.depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
   glDepthMask(E.ds.depthWriteEnable && E.depth ? GL_TRUE : GL_FALSE);
@@ -555,7 +565,7 @@ void RunDraw(DkPrimitive prim, uint32_t count, uint32_t first, int32_t vertex_of
   const ShaderData* vs = reinterpret_cast<const ShaderData*>(E.shaders[DkStage_Vertex]);
   const ShaderData* gs = reinterpret_cast<const ShaderData*>(E.shaders[DkStage_Geometry]);
   const ShaderData* fs = reinterpret_cast<const ShaderData*>(E.shaders[DkStage_Fragment]);
-  if (!vs || !fs || (!E.color && !E.depth)) return;
+  if (!vs || !fs || (!E.depth && std::none_of(E.color.begin(), E.color.end(), [](auto* c) { return c; }))) return;
   GLuint prog = ProgramFor(vs, gs, fs);
   if (!prog) return;
   BindFramebuffer(E.color, E.depth);
@@ -811,7 +821,9 @@ void dkCmdBufBindSamplerDescriptorSet(DkCmdBuf c, DkGpuAddr addr, uint32_t) {
 }
 
 void dkCmdBufBindRenderTargets(DkCmdBuf c, DkImageView const* const colorTargets[], uint32_t numColor, DkImageView const* depthTarget) {
-  const ImageData* color = numColor ? reinterpret_cast<const ImageData*>(colorTargets[0]->pImage->_storage) : nullptr;
+  std::array<const ImageData*, 4> color{};
+  for (uint32_t i = 0; i < std::min(numColor, 4u); i++)
+    if (colorTargets[i]) color[i] = reinterpret_cast<const ImageData*>(colorTargets[i]->pImage->_storage);
   const ImageData* depth = depthTarget ? reinterpret_cast<const ImageData*>(depthTarget->pImage->_storage) : nullptr;
   c->ops.push_back([=] { E.color = color; E.depth = depth; });
 }
@@ -819,7 +831,10 @@ void dkCmdBufBindRenderTargets(DkCmdBuf c, DkImageView const* const colorTargets
 void dkCmdBufBindRasterizerState(DkCmdBuf c, DkRasterizerState const* s) { DkRasterizerState v = *s; c->ops.push_back([=] { E.rast = v; }); }
 void dkCmdBufBindColorState(DkCmdBuf c, DkColorState const* s) { DkColorState v = *s; c->ops.push_back([=] { E.colorstate = v; }); }
 void dkCmdBufBindColorWriteState(DkCmdBuf c, DkColorWriteState const* s) { DkColorWriteState v = *s; c->ops.push_back([=] { E.colorwrite = v; }); }
-void dkCmdBufBindBlendStates(DkCmdBuf c, uint32_t, DkBlendState const states[], uint32_t) { DkBlendState v = states[0]; c->ops.push_back([=] { E.blend = v; }); }
+void dkCmdBufBindBlendStates(DkCmdBuf c, uint32_t first, DkBlendState const states[], uint32_t count) {
+  std::vector<DkBlendState> values(states, states + count);
+  c->ops.push_back([=] { for (uint32_t i = 0; i < values.size() && first + i < E.blend.size(); i++) E.blend[first + i] = values[i]; });
+}
 void dkCmdBufBindDepthStencilState(DkCmdBuf c, DkDepthStencilState const* s) { DkDepthStencilState v = *s; c->ops.push_back([=] { E.ds = v; }); }
 
 void dkCmdBufBindVtxAttribState(DkCmdBuf c, DkVtxAttribState const attribs[], uint32_t n) {
@@ -843,15 +858,15 @@ void dkCmdBufBindIdxBuffer(DkCmdBuf c, DkIdxFormat format, DkGpuAddr addr) {
 void dkCmdBufSetViewports(DkCmdBuf c, uint32_t, DkViewport const v[], uint32_t) { DkViewport vp = v[0]; c->ops.push_back([=] { E.viewport = vp; }); }
 void dkCmdBufSetScissors(DkCmdBuf c, uint32_t, DkScissor const s[], uint32_t) { DkScissor sc = s[0]; c->ops.push_back([=] { E.scissor = sc; }); }
 
-void dkCmdBufClearColor(DkCmdBuf c, uint32_t, uint32_t mask, const void* data) {
+void dkCmdBufClearColor(DkCmdBuf c, uint32_t target, uint32_t mask, const void* data) {
   float col[4];
   std::memcpy(col, data, sizeof(col));
   c->ops.push_back([=] {
-    if (!E.color) return;
+    if (target >= E.color.size() || !E.color[target]) return;
     BindFramebuffer(E.color, E.depth);
     ApplyScissorViewport();
-    glColorMask((mask & 1) != 0, (mask & 2) != 0, (mask & 4) != 0, (mask & 8) != 0);
-    glClearBufferfv(GL_COLOR, 0, col);
+    glColorMaski(target, (mask & 1) != 0, (mask & 2) != 0, (mask & 4) != 0, (mask & 8) != 0);
+    glClearBufferfv(GL_COLOR, target, col);
     CheckGl("clear color");
   });
 }
