@@ -233,6 +233,10 @@ struct Frame {
   std::unordered_map<uint64_t, TexBind> texbinds;
   // GPU timestamps: pipeline top at the frame's first command, bottom before the present (16-byte reports).
   uint32_t ts_off = UINT32_MAX;
+  MemBlock checkpoint_data;  // optional GPU report storage, separate from the frame ring
+  uint32_t checkpoint_swap = 0;
+  std::vector<std::string> checkpoints;
+  bool checkpoints_full = false;
   bool rec_pending = false;  // RECORD 5 SEC: this frame's shown image waits in rec_ for the fence
   uint32_t rec_swap = 0;
   uint64_t rec_us = 0;
@@ -478,7 +482,17 @@ class Deko3dCommandProcessor : public CommandProcessor {
     present_target_ = access((debug_dir + "dk_present_rt").c_str(), F_OK) == 0;
     dump_images_ = access((debug_dir + "dk_dump").c_str(), F_OK) == 0;  // readback dumps stall the GPU: debug only
     debug_dir_ = debug_dir;
-    if (FILE* sf = std::fopen((debug_dir + "dk_skip").c_str(), "r")) {
+    gpu_checkpoints_ = access((debug_dir + "dk_gpu_checkpoints").c_str(), F_OK) == 0;
+    if (gpu_checkpoints_) {
+      Log("GPU checkpoints enabled; dk_skip is ignored");
+      for (Frame& f : frames_) {
+        if (!f.checkpoint_data.Create(device_, kMaxCheckpoints * 16, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuUncached)) {
+          Log("GPU checkpoint buffer allocation failed");
+          return false;
+        }
+      }
+    }
+    if (FILE* sf = gpu_checkpoints_ ? nullptr : std::fopen((debug_dir + "dk_skip").c_str(), "r")) {
       unsigned long long v, p;
       while (std::fscanf(sf, "%llx %llx", &v, &p) == 2) skip_pairs_.insert(PairKey({v, p}));
       std::fclose(sf);
@@ -844,6 +858,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
     } else {
       dkCmdBufDraw(cmd, prim, index_count, 1, 0, 0);
     }
+    Checkpoint(f, "draw VS %016llX PS %016llX n=%u target=%ux%u first_texture=%08X %ux%u",
+               (unsigned long long)vs->ucode_data_hash(), (unsigned long long)ps->ucode_data_hash(), index_count,
+               bound_color_ ? bound_color_->width : 0, bound_color_ ? bound_color_->height : 0,
+               tcount ? tnames[0].base : 0, tcount ? tnames[0].w : 0, tcount ? tnames[0].h : 0);
     if (trace_enabled_ && !traced_) {
       // One line per draw of a gameplay frame (file sdmc:/switch/tmnt/dk_trace): what the HP/MP bar and the
       // scaled sprites are drawn with.
@@ -979,6 +997,15 @@ class Deko3dCommandProcessor : public CommandProcessor {
       for (auto& it : guest_images_) if ((trace_frame || it.second->width >= 600) && it.second != front) { char n[48]; std::snprintf(n, sizeof(n), "guest %08X%s", it.first, it.second->from_resolve ? " (resolve)" : " (upload)"); queue_dump(n, it.second); }
       dkCmdBufBarrier(cmd, DkBarrier_Full, 0);
     }
+    // Inspect completed submissions before acquire can abort on a faulted queue, without waiting.
+    if (gpu_checkpoints_) {
+      for (Frame& submitted : frames_) {
+        if (!submitted.fenced) continue;
+        DkResult result = dkFenceWait(&submitted.fence, 0);
+        const uint64_t* ts = submitted.ts_off != UINT32_MAX ? reinterpret_cast<const uint64_t*>(submitted.data.cpu + submitted.ts_off) : nullptr;
+        if (result == DkResult_Success && ts && !ts[2] && !ts[3]) ReportCheckpoints(submitted);
+      }
+    }
     if (swaps_ < 5) Log("swap #%u: acquiring a swapchain image", swaps_ + 1);
     const double acq0 = NowMs();
     int slot = dkQueueAcquireImage(queue_, swapchain_);
@@ -998,6 +1025,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // Black (it was a debug navy: the user saw a blue flash at start, before the first front buffer exists).
     const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     dkCmdBufClearColor(cmd, 0, DkColorMask_RGBA, black);
+    Checkpoint(f, "present clear %ux%u", kPresentWidth, kPresentHeight);
     if (front && present_vs_ && present_fs_) {
       DkRasterizerState rs;
       dkRasterizerStateDefaults(&rs);
@@ -1046,16 +1074,21 @@ class Deko3dCommandProcessor : public CommandProcessor {
         DkResHandle handle = dkMakeTextureHandle(dslot, clamp | 3u);
         dkCmdBufBindTextures(cmd, DkStage_Fragment, 0, &handle, 1);
         dkCmdBufDraw(cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
+        Checkpoint(f, "present draw front=%08X %ux%u", front->guest_base, front->width, front->height);
       }
     }
-    if (f.ts_off != UINT32_MAX) dkCmdBufReportCounter(cmd, DkCounter_Timestamp, f.data.gpu + f.ts_off + 16);
+    if (!gpu_checkpoints_ && f.ts_off != UINT32_MAX)
+      dkCmdBufReportCounter(cmd, DkCounter_Timestamp, f.data.gpu + f.ts_off + 16);
 #ifndef TMNT_DK_GL
     RecordFrame(f, cmd, front);
 #endif
     dkCmdBufBarrier(cmd, DkBarrier_Full, 0);
+    if (gpu_checkpoints_ && f.ts_off != UINT32_MAX)
+      dkCmdBufReportCounter(cmd, DkCounter_Timestamp, f.data.gpu + f.ts_off + 16);
     DkCmdList list = dkCmdBufFinishList(cmd);
     dkQueueSubmitCommands(queue_, list);
     dkQueueSignalFence(queue_, &f.fence, false);
+    f.checkpoint_swap = swaps_ + 1;
     f.fenced = true;
     dkQueuePresentImage(queue_, swapchain_, slot);
     // Shown-frame intervals: what the screen gets (the [nx] fps line counts guest swaps).
@@ -1192,6 +1225,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   // pairs; delete dk_skip to undo.
   void NoteFaultedFrame(const Frame& f) {
     LogHungFrame(f);
+    if (gpu_checkpoints_) { ReportCheckpoints(f); return; }
     int n = 0;
     if (FILE* o = std::fopen((debug_dir_ + "dk_skip").c_str(), "a")) {
       for (const auto& d : f.draw_log) {
@@ -1262,6 +1296,51 @@ class Deko3dCommandProcessor : public CommandProcessor {
   mutable bool skip_checked_[1] = {false};
 
   // ----- frames ---------------------------------------------------------------------------------
+  static constexpr uint32_t kMaxCheckpoints = 4096;
+  void Checkpoint(Frame& f, const char* fmt, ...) {
+    if (!gpu_checkpoints_ || !f.checkpoint_data.block) return;
+    if (f.checkpoints.size() == kMaxCheckpoints) { f.checkpoints_full = true; return; }
+    char line[384];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    uint32_t index = uint32_t(f.checkpoints.size());
+    f.checkpoints.emplace_back(line);
+    // A full barrier precedes the graphics report; fault timing can still make the boundary ambiguous.
+    dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, 0);
+    dkCmdBufReportCounter(f.cmdbuf, DkCounter_Timestamp, f.checkpoint_data.gpu + index * 16);
+  }
+  void ReportCheckpoints(const Frame& f) {
+    if (gpu_reported_) return;
+    FILE* out = std::fopen((debug_dir_ + "dk_gpu_fault.txt").c_str(), "w");
+    if (!out) { Log("GPU checkpoint report could not be opened"); return; }
+    std::fprintf(out, "frame %u, swap %u: %zu checkpoints%s\n", uint32_t(&f - frames_), f.checkpoint_swap, f.checkpoints.size(),
+                 f.checkpoints_full ? " (limit reached)" : "");
+    std::fprintf(out, "Reports follow full barriers; missing reports bracket incomplete work, not necessarily the exact fault.\n");
+    size_t first_missing = 0;
+    while (first_missing < f.checkpoints.size()) {
+      const uint64_t* report = reinterpret_cast<const uint64_t*>(f.checkpoint_data.cpu + first_missing * 16);
+      if (!report[0] && !report[1]) break;
+      first_missing++;
+    }
+    if (first_missing) std::fprintf(out, "last consecutive completed: %zu %s\n", first_missing - 1, f.checkpoints[first_missing - 1].c_str());
+    else std::fprintf(out, "last consecutive completed: none\n");
+    if (first_missing < f.checkpoints.size()) std::fprintf(out, "first missing: %zu %s\n", first_missing, f.checkpoints[first_missing].c_str());
+    else std::fprintf(out, "first missing: none in recorded checkpoints%s\n", f.checkpoints_full ? " (limit reached)" : "");
+    for (size_t i = 0; i < f.checkpoints.size(); i++) {
+      const uint64_t* report = reinterpret_cast<const uint64_t*>(f.checkpoint_data.cpu + i * 16);
+      std::fprintf(out, "%zu %s %s\n", i, (report[0] || report[1]) ? "done" : "missing", f.checkpoints[i].c_str());
+    }
+    const bool write_failed = std::ferror(out) != 0;
+    if (std::fclose(out) != 0 || write_failed) {
+      Log("GPU checkpoint report could not be written completely");
+      return;
+    }
+    gpu_reported_ = true;
+    Log("GPU checkpoints written to %sdk_gpu_fault.txt", debug_dir_.c_str());
+  }
+
   void BeginFrame() {
     Frame& f = frames_[frame_];
     if (f.fenced) {
@@ -1287,6 +1366,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
       f.fenced = false;
     }
     f.draw_log.clear();
+    f.checkpoints.clear();
+    f.checkpoints_full = false;
 #ifndef TMNT_DK_GL
     if (f.rec_pending) {
       const uint32_t bytes = kRecW * kRecH * 4;
@@ -1316,6 +1397,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       std::memset(f.data.cpu + f.ts_off, 0, 32);
       dkCmdBufReportCounter(f.cmdbuf, DkCounter_TimestampPipelineTop, f.data.gpu + f.ts_off);
     }
+    if (gpu_checkpoints_) std::memset(f.checkpoint_data.cpu, 0, kMaxCheckpoints * 16);
     dkCmdBufBindImageDescriptorSet(f.cmdbuf, descriptors_.gpu + f.desc_offset, kMaxImageDescriptors);
     dkCmdBufBindSamplerDescriptorSet(f.cmdbuf, descriptors_.gpu + sampler_desc_offset_, kSamplerCount);
     bound_color_ = nullptr;
@@ -1499,6 +1581,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       dkCmdBufSetScissors(cmd, 0, &sc, 1);
       dkCmdBufClearColor(cmd, 0, DkColorMask_RGBA, zero);
     }
+    Checkpoint(frames_[frame_], "clear new image guest=%08X edram=%u %ux%u depth=%u", img->guest_base, img->edram_base, img->width, img->height, img->is_depth);
   }
 
   static uint32_t EffectivePitch(reg::RB_SURFACE_INFO surf) {
@@ -1544,6 +1627,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   // resolve asks for a minimum size (`at_least`) and creates with the aligned size (`create_w/h`).
   HostImage* GuestImage(Frame& f, uint32_t base, uint32_t width, uint32_t height, DkImageFormat format, bool at_least,
                         uint32_t create_w = 0, uint32_t create_h = 0) {
+    if (!width || !height) { Log("invalid guest image %08X %ux%u", base, width, height); return nullptr; }
     auto it = guest_images_.find(base);
     if (it != guest_images_.end()) {
       HostImage* img = it->second;
@@ -1568,7 +1652,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
         height = std::max(height, img->height);
       }
       HostImage* resized = CreateImage(width, height, img->format, DkImageFlags_UsageRender, false);
-      if (!resized) return img;
+      if (!resized) return at_least ? img : nullptr;
       if (!img->from_resolve) {
         // An uploaded texture whose memory now holds a texture of another size (the game reuses sprite memory:
         // 20-30 size changes per address in a stage): the tiled layout differs, so the old texels are noise.
@@ -1588,6 +1672,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       DkImageRect sr{0, 0, 0, cw, ch, 1}, dr{0, 0, 0, cw, ch, 1};
       dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
       dkCmdBufCopyImage(f.cmdbuf, &sv, &sr, &dv, &dr, 0);
+      Checkpoint(f, "resize %08X %ux%u -> %ux%u copy %ux%u", base, img->width, img->height, resized->width, resized->height, cw, ch);
       dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
       resized->from_resolve = img->from_resolve;
       resized->content_serial = img->content_serial;
@@ -1729,6 +1814,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
   bool UploadTexture(Frame& f, HostImage& img, const TextureInfo& info, const TexSource& s, xenos::Endian endian) {
     const FormatInfo* fi = info.format_info();
     const uint32_t width = s.width, height = s.height;
+    if (!width || !height || width > img.width || height > img.height) {
+      Log("invalid upload %08X %ux%u into %ux%u", s.address, width, height, img.width, img.height);
+      return false;
+    }
     uint32_t bw = (width + fi->block_width - 1) / fi->block_width;
     uint32_t bh = (height + fi->block_height - 1) / fi->block_height;
     uint32_t bpb = fi->bytes_per_block();
@@ -1761,6 +1850,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // may still be sampling it.
     dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, 0);
     dkCmdBufCopyBufferToImage(f.cmdbuf, &cb, &view, &rect, 0);
+    Checkpoint(f, "upload %08X %ux%u image %ux%u", s.address, width, height, img.width, img.height);
     dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
     uploads_++;
     upload_bytes_ += bytes;
@@ -1958,6 +2048,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       dkCmdBufSetScissors(cmd, 0, &sc, 1);
       if (color_img) dkCmdBufClearColor(cmd, 0, DkColorMask_RGBA, color);
       if (depth_img) dkCmdBufClearDepthStencil(cmd, true, z, 0xFF, 0);
+      Checkpoint(f, "clear EDRAM color=%u depth=%u rect %u,%u %ux%u", color_info.color_base, depth_info.depth_base, sc.x, sc.y, sc.width, sc.height);
       {
         char key[96];
         std::snprintf(key, sizeof(key), "clear %u %u %u %u %u %u %u %u", uint32_t(mode), color_info.color_base, depth_info.depth_base, pitch,
@@ -2008,6 +2099,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       DkImageRect sr{x, y, 0, w, h, 1}, dr{dx, dy, 0, w, h, 1};
       dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
       dkCmdBufCopyImage(cmd, &sv, &sr, &dv, &dr, 0);
+      Checkpoint(f, "resolve EDRAM %u %ux%u rect %u,%u %ux%u -> %08X %ux%u at %u,%u", info.color_edram_info.base_tiles, src->width, src->height, x, y, w, h, info.copy_dest_base, dst->width, dst->height, dx, dy);
       dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
     }
     if (info.IsClearingColor()) {
@@ -2017,6 +2109,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       uint32_t c = info.rb_color_clear;
       float color[4] = {((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f, ((c >> 24) & 0xFF) / 255.0f};
       dkCmdBufClearColor(cmd, 0, DkColorMask_RGBA, color);
+      Checkpoint(f, "resolve clear EDRAM %u rect %u,%u %ux%u", info.color_edram_info.base_tiles, x, y, w, h);
     }
     {
       // Every distinct resolve (source rect, destination and offset) once: the frame structure.
@@ -2164,6 +2257,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     DkCopyBuf cb{rec_.gpu + uint64_t(frame_) * kRecW * kRecH * 4, 0, 0};
     dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
     dkCmdBufCopyImageToBuffer(cmd, &v, &r, &cb, 0);
+    Checkpoint(f, "record readback %08X %ux%u", shown->guest_base, kRecW, kRecH);
     f.rec_pending = true;
     f.rec_swap = swaps_ + 1;
     f.rec_us = us;
@@ -2178,6 +2272,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
   uint32_t busy_skips_ = 0;
   double shown_last_ms_ = 0;      // the last present (the shown-frame intervals of the dk time/s line)
   std::vector<double> shown_ms_;
+  bool gpu_reported_ = false;
+  bool gpu_checkpoints_ = false;  // opt-in: sdmc:/switch/tmnt/dk_gpu_checkpoints
   bool dump_images_ = false;
   bool trace_enabled_ = false, traced_ = false, trace_any_ = false;  // file dk_trace: one line per draw of the first frame with 440+ draws
   uint32_t trace_min_swap_ = 0;  // seconds after the backend started

@@ -17,6 +17,15 @@ Rumble works. **L3 + R3** opens the settings menu: frame rate, rumble, volume, f
 skip intro and the language (en, fr, de, it, es, pt-BR; the last two after a restart).
 The game hooks of the PC build are in, except online play: the FIRE menu has no Xbox Live entries.
 
+### GPU fault capture
+
+Create an empty `/switch/tmnt/dk_gpu_checkpoints` file on the SD card and restart the game.
+Save any previous `dk_gpu_fault.txt` before testing so you can identify a fresh report.
+Reproduce the fault, then collect `dk_gpu_fault.txt` and `tmnt_log.txt` from the same folder.
+The report shows the last completed checkpoint and the next checkpoint in the command list.
+With the marker present, the renderer ignores the `dk_skip` shader list.
+The extra GPU barriers can change when the fault occurs. Remove the marker to return to normal timing.
+
 ## Building
 
 The build runs in WSL or Linux with devkitPro (devkitA64, libnx, deko3d, uam) and a mesa-switch NVK build.
