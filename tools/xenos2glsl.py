@@ -487,7 +487,8 @@ class Translator:
                     if not m2:
                         self.err('bad loop', line)
                     self.has_loop = True
-                    blocks.append({'index': idx, 'kind': op, 'loop': int(m2.group(2)), 'stmts': []})
+                    blocks.append({'index': idx, 'kind': op, 'loop': int(m2.group(2)), 'target': int(m2.group(3)),
+                                   'stmts': []})
                 elif op in ('call', 'ccall', 'ret'):
                     self.err('control flow %s is not supported' % op, line)
                 else:
@@ -630,9 +631,12 @@ class Translator:
             return ' && '.join(conds)
 
         if self.has_loop:
-            if self.has_jump:
-                self.err('loops together with jumps are not supported')
             out.append(ind + 'int aL = 0;')
+            if self.has_jump:
+                # Loops inside the jump state machine: one counter per loop constant (TMNT's skinning VS
+                # 9DB72E7E14CAE5B0: three bone loops, then jumps). Nested loops would need an aL stack.
+                for n in sorted({b['loop'] for b in blocks if b['kind'] == 'loop'}):
+                    out.append(ind + 'int li_%d = 0, lcount_%d = 0, lstep_%d = 0;' % (n, n, n))
         if not self.has_jump:
             for b in blocks:
                 if b['kind'] == 'loop':
@@ -675,6 +679,14 @@ class Translator:
                         out.append(ind + '    pc = (%s) ? %d : %d;' % (cond, b['target'], nxt))
                     else:
                         out.append(ind + '    pc = %d;' % b['target'])
+                elif b['kind'] == 'loop':  # target: past the endloop when the count is 0
+                    n = b['loop']
+                    out.append(ind + '    { uint lc = loops[%d][%d]; lcount_%d = int(lc & 255u); aL = int((lc >> 8) & 255u); '
+                                     'lstep_%d = int(int((lc >> 16) & 255u) << 24) >> 24; li_%d = 0; }' % (n // 4, n % 4, n, n, n))
+                    out.append(ind + '    pc = lcount_%d > 0 ? %d : %d;' % (n, nxt, b['target']))
+                elif b['kind'] == 'endloop':  # target: the loop body
+                    n = b['loop']
+                    out.append(ind + '    aL += lstep_%d; pc = ++li_%d < lcount_%d ? %d : %d;' % (n, n, n, b['target'], nxt))
                 else:
                     out.append(ind + '    pc = %d;' % nxt)
                 out.append(ind + '  } break;')
