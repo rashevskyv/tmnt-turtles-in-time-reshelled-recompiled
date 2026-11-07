@@ -20,9 +20,10 @@ The game hooks of the PC build are in, except online play: the FIRE menu has no 
 ### GPU fault capture
 
 Create an empty `/switch/tmnt/dk_gpu_checkpoints` file on the SD card and restart the game.
-Save any previous `dk_gpu_fault.txt` before testing so you can identify a fresh report.
-Reproduce the fault, then collect `dk_gpu_fault.txt` and `tmnt_log.txt` from the same folder.
+Save any previous `dk_gpu_fault.txt` and `dk_gpu_pending.txt` before testing.
+Reproduce the fault, then collect the new reports and `tmnt_log.txt` from the same folder.
 The report shows the last completed checkpoint and the next checkpoint in the command list.
+If the fence stays busy for 120 skipped frames, `dk_gpu_pending.txt` records a snapshot while the GPU may still be running.
 With the marker present, the renderer ignores the `dk_skip` shader list.
 The extra GPU barriers can change when the fault occurs. Remove the marker to return to normal timing.
 

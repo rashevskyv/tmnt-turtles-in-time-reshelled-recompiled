@@ -1248,7 +1248,16 @@ class Deko3dCommandProcessor : public CommandProcessor {
       skip_frame_ = true;
     } else if (skip_odd_ && frames_[frame_].fenced && dkFenceWait(&frames_[frame_].fence, 0) != DkResult_Success) {
       skip_frame_ = true;
-      if (++busy_run_ == 120) LogHungFrame(frames_[frame_]);  // 2 s of a busy GPU: the frame hung it (console 0.53)
+      if (++busy_run_ == 120) {
+        LogHungFrame(frames_[frame_]);
+        if (gpu_checkpoints_) {
+          // Save the live snapshot before a driver error check can abort the process.
+          ReportCheckpoints(frames_[frame_], true);
+          const DkResult result = dkFenceWait(&frames_[frame_].fence, 10000000ll);
+          Log("pending frame %u: diagnostic fence wait result %d, queue error %d", frame_, int(result),
+              int(dkQueueIsInErrorState(queue_)));
+        }
+      }
       busy_skips_++;
     }
     if (!skip_frame_ && !begun_) {
@@ -1311,10 +1320,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
     dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, 0);
     dkCmdBufReportCounter(f.cmdbuf, DkCounter_Timestamp, f.checkpoint_data.gpu + index * 16);
   }
-  void ReportCheckpoints(const Frame& f) {
-    if (gpu_reported_) return;
-    FILE* out = std::fopen((debug_dir_ + "dk_gpu_fault.txt").c_str(), "w");
+  void ReportCheckpoints(const Frame& f, bool pending = false) {
+    if (!pending && gpu_reported_) return;
+    const char* name = pending ? "dk_gpu_pending.txt" : "dk_gpu_fault.txt";
+    FILE* out = std::fopen((debug_dir_ + name).c_str(), "w");
     if (!out) { Log("GPU checkpoint report could not be opened"); return; }
+    if (pending) std::fprintf(out, "Live snapshot after 120 busy skips; the GPU may still be running. Reports may change while read.\n");
     std::fprintf(out, "frame %u, swap %u: %zu checkpoints%s\n", uint32_t(&f - frames_), f.checkpoint_swap, f.checkpoints.size(),
                  f.checkpoints_full ? " (limit reached)" : "");
     std::fprintf(out, "Reports follow full barriers; missing reports bracket incomplete work, not necessarily the exact fault.\n");
@@ -1337,8 +1348,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
       Log("GPU checkpoint report could not be written completely");
       return;
     }
-    gpu_reported_ = true;
-    Log("GPU checkpoints written to %sdk_gpu_fault.txt", debug_dir_.c_str());
+    if (!pending) gpu_reported_ = true;
+    Log("GPU checkpoints written to %s%s", debug_dir_.c_str(), name);
   }
 
   void BeginFrame() {
