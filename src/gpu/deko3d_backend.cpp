@@ -339,6 +339,7 @@ bool TextureFormatOf(xenos::TextureFormat f, DkImageFormat& out, bool& reversed)
   reversed = false;
   switch (f) {
     case TF::k_8_8_8_8: case TF::k_8_8_8_8_A: out = DkImageFormat_RGBA8_Unorm; return true;
+    case TF::k_2_10_10_10: case TF::k_2_10_10_10_AS_16_16_16_16: out = DkImageFormat_RGB10A2_Unorm; return true;
     case TF::k_8: case TF::k_8_A: case TF::k_8_B: out = DkImageFormat_R8_Unorm; return true;
     case TF::k_8_8: out = DkImageFormat_RG8_Unorm; return true;
     case TF::k_DXT1: out = DkImageFormat_RGBA_BC1; return true;
@@ -2208,9 +2209,14 @@ class Deko3dCommandProcessor : public CommandProcessor {
     uint32_t x = info.coordinate_info.edram_offset_x_div_8 * 8, y = info.coordinate_info.edram_offset_y_div_8 * 8;
     uint32_t w = info.coordinate_info.width_div_8 * 8, h = info.height_div_8 * 8;
     auto src_format = xenos::ColorRenderTargetFormat(info.color_edram_info.format);
-    if (src->format != DkImageFormat_RGBA8_Unorm && src->format != DkImageFormat_RGBA8_Unorm_sRGB) {
-      LogOnce("resolvefmt", "color resolve EDRAM %u format %u to format %u is unsupported", info.color_edram_info.base_tiles,
-              uint32_t(src_format), uint32_t(info.copy_dest_info.copy_dest_format));
+    const bool packed = src->format == DkImageFormat_RGB10A2_Unorm &&
+                        src_format == xenos::ColorRenderTargetFormat::k_2_10_10_10 &&
+                        xenos::IsColorResolveFormatBitwiseEquivalent(src_format, info.copy_dest_info.copy_dest_format) &&
+                        !info.copy_dest_info.copy_dest_exp_bias && !info.copy_dest_info.copy_dest_swap;
+    if (!packed && src->format != DkImageFormat_RGBA8_Unorm && src->format != DkImageFormat_RGBA8_Unorm_sRGB) {
+      LogOnce("resolvefmt", "color resolve EDRAM %u format %u to format %u bias %d swap %u is unsupported", info.color_edram_info.base_tiles,
+              uint32_t(src_format), uint32_t(info.copy_dest_info.copy_dest_format), info.copy_dest_info.copy_dest_exp_bias,
+              info.copy_dest_info.copy_dest_swap);
       if (info.IsClearingColor()) {
         BindTargets(cmd, src, nullptr);
         DkScissor sc{x, y, x < src->width ? std::min(w, src->width - x) : 0,
@@ -2227,7 +2233,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     uint32_t dest_height = info.copy_dest_coordinate_info.height_aligned_div_32 * 32;
     (void)dest_pitch; (void)dest_height;
     uint32_t dx = info.copy_dest_coordinate_info.offset_x_div_8 * 8, dy = info.copy_dest_coordinate_info.offset_y_div_8 * 8;
-    HostImage* dst = GuestImage(f, info.copy_dest_base, dx + w, dy + h, DkImageFormat_RGBA8_Unorm, true);  // gh: exact size (the aligned one made it ping-pong with the texture bind)
+    HostImage* dst = GuestImage(f, info.copy_dest_base, dx + w, dy + h,
+                                packed ? DkImageFormat_RGB10A2_Unorm : DkImageFormat_RGBA8_Unorm, true);
     if (!dst) return true;
     dst->from_resolve = true;
     dst->content_serial = serial_;
