@@ -1650,7 +1650,18 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (img && !img->is_depth) free_images_.push_back(img);
   }
 
+  static bool BlockCompressed(DkImageFormat format) {
+    switch (format) {
+      case DkImageFormat_RGBA_BC1: case DkImageFormat_RGBA_BC2: case DkImageFormat_RGBA_BC3: case DkImageFormat_RG_BC5_Unorm:
+      case DkImageFormat_R_BC4_Unorm: return true;
+      default: return false;
+    }
+  }
+
   HostImage* CreateImage(uint32_t width, uint32_t height, DkImageFormat format, uint32_t flags, bool is_depth) {
+    // Block-compressed formats cannot be render targets: deko3dd rejects the layout (dk_image.cpp:353 "specified
+    // format does not support DkImageFlags_UsageRender", Eden 0.68); the release library built it anyway.
+    if (BlockCompressed(format)) flags &= ~uint32_t(DkImageFlags_UsageRender);
     for (size_t i = 0; i < free_images_.size(); i++) {
       HostImage* r = free_images_[i];
       if (r->width == width && r->height == height && r->format == format && r->flags == flags && r->is_depth == is_depth) {
@@ -1696,12 +1707,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   // not reach). Render targets and resolve destinations start cleared to zero instead; textures are
   // fully uploaded, and block-compressed images cannot be cleared.
   void ClearNewImage(HostImage* img) {
-    if (!img || !frames_[frame_].cmdbuf) return;
-    switch (img->format) {
-      case DkImageFormat_RGBA_BC1: case DkImageFormat_RGBA_BC2: case DkImageFormat_RGBA_BC3: case DkImageFormat_RG_BC5_Unorm:
-      case DkImageFormat_R_BC4_Unorm: return;
-      default: break;
-    }
+    if (!img || !frames_[frame_].cmdbuf || BlockCompressed(img->format)) return;
     DkCmdBuf cmd = frames_[frame_].cmdbuf;
     DkScissor sc{0, 0, img->width, img->height};
     if (img->is_depth) {
