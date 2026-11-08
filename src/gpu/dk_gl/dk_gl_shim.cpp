@@ -227,6 +227,7 @@ struct Exec {
   DkResHandle tex[DK_NUM_TEXTURE_BINDINGS] = {};
   bool tex_bound[DK_NUM_TEXTURE_BINDINGS] = {};
   DkBufExtents ubo[2][DK_NUM_UNIFORM_BUFS] = {};  // [0] vertex, [1] fragment
+  DkBufExtents ssbo[DK_NUM_STORAGE_BUFS] = {};    // vertex stage: the indexed vertex streams
   DkGpuAddr image_desc_set = 0, sampler_desc_set = 0;
   bool inited = false;
 } E;
@@ -593,6 +594,18 @@ void RunDraw(DkPrimitive prim, uint32_t count, uint32_t first, int32_t vertex_of
       glBindBufferRange(GL_UNIFORM_BUFFER, st == 1 && i == 0 ? 8 : i, ubo, 0, b.size);
     }
   }
+  // Storage buffers (vertex stage): the streams of a shader with computed fetch indices.
+  for (uint32_t i = 0; i < DK_NUM_STORAGE_BUFS; i++) {
+    const DkBufExtents& b = E.ssbo[i];
+    if (!b.size) continue;
+    const uint8_t* p = HostPtr(b.addr);
+    if (!p) continue;
+    static GLuint ssbos[DK_NUM_STORAGE_BUFS] = {};
+    if (!ssbos[i]) glGenBuffers(1, &ssbos[i]);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbos[i]);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, b.size, p, GL_STREAM_DRAW);
+    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, i, ssbos[i], 0, b.size);
+  }
   // Textures (fragment stage only here).
   for (uint32_t i = 0; i < DK_NUM_TEXTURE_BINDINGS; i++) {
     if (!E.tex_bound[i]) continue;
@@ -813,6 +826,14 @@ void dkCmdBufBindUniformBuffers(DkCmdBuf c, DkStage stage, uint32_t firstId, DkB
   c->ops.push_back([=] {
     int st = stage == DkStage_Vertex ? 0 : 1;
     for (uint32_t i = 0; i < v.size(); i++) E.ubo[st][firstId + i] = v[i];
+  });
+}
+
+void dkCmdBufBindStorageBuffers(DkCmdBuf c, DkStage stage, uint32_t firstId, DkBufExtents const buffers[], uint32_t n) {
+  std::vector<DkBufExtents> v(buffers, buffers + n);
+  c->ops.push_back([=] {
+    if (stage != DkStage_Vertex) return;
+    for (uint32_t i = 0; i < v.size() && firstId + i < DK_NUM_STORAGE_BUFS; i++) E.ssbo[firstId + i] = v[i];
   });
 }
 

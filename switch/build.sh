@@ -24,7 +24,7 @@ CLI=$SDK/out/linux-amd64/Release/rexglue
 [ -x "$CLI" ] || { echo "no host CLI: $CLI"; exit 1; }
 
 mkdir -p "$SRC"
-rsync -rlc --delete --exclude /out --exclude /game --exclude /generated --exclude /.git "$GIT_DIR/" "$SRC/"
+rsync -rlc --delete --exclude /out --exclude /game --exclude /generated --exclude /.git --exclude /graphify-out "$GIT_DIR/" "$SRC/"
 [ -f "$SRC/game/extracted/default.xex" ] || { echo "no game files: $SRC/game/extracted/default.xex"; exit 1; }
 # Switch only: skip_msr (the SDK's one process-wide mtmsrd mutex cost the Castlevania port a third of its
 # worker time). The flag goes into the copy's [entrypoint]; the PC manifest stays as it is.
@@ -102,6 +102,8 @@ if [ -d "$SHADER_DUMPS" ]; then
         [ -f "$f" ] || continue
         cp "$f" "$STAGE/shaders/$(basename "$f" .glsl.dksh).dksh"
     done
+    # Markers of the vertex shaders whose streams are storage buffers (computed fetch indices).
+    cp "$BUILD"/glsl/*.vert.ssbo "$STAGE/shaders/" 2>/dev/null || true
 fi
 cp "$BUILD/tmnt.nro" "$STAGE/tmnt.nro"
 touch "$STAGE/deko3d"

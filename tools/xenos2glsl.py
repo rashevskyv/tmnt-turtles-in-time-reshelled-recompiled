@@ -8,6 +8,9 @@ with a clear message so the gap is visible (docs/native-renderer-plan.md, M2).
 Interface of the generated GLSL (the deko3d backend relies on it):
   vertex:   layout(location = a) in vec4 in_a      one per vfetch that reads data (in instruction order); the
             sidecar JSON lists (slot, offset, format, stride, signed, integer) per attribute;
+            or, when a fetch index is computed (not the untouched r0.x), no attributes: every stream is
+            layout(std430, binding = b) readonly buffer { uint w[]; } (b = the SDK's vertex binding index) and
+            an empty shader_<hash>.vert.ssbo marker tells the backend to bind storage buffers;
             binding 0 = uniform Consts { vec4 c[256]; } (the ALU constants c0..c255);
             binding 1 = uniform Sys (ndc_scale, ndc_offset, alpha test, bool constants);
             layout(location = k) out vec4 o_k      the interpolators the shader exports.
@@ -40,9 +43,17 @@ REPLICATED = {'dp4', 'dp3', 'dp2add', 'max4', 'setp_eq_push', 'setp_ne_push', 's
 
 
 class Translator:
-    def __init__(self, text, stage, name):
+    def __init__(self, text, stage, name, ssbo=False):
         self.stage = stage  # 'vert' or 'frag'
         self.name = name
+        # Indexed vertex fetches (the SDK semantic: address = base + floor(index) * stride + offset). A vfetch_full
+        # whose index is the untouched r0.x reads record gl_VertexID: a vertex attribute. TMNT's scene shaders
+        # (F7F9306F5415C989, 5EC28769AF7E6764) fetch the mesh by r0.x mod c19.x and the matrices by r0.x / c19.x;
+        # such a shader reads every stream from a storage buffer (binding = the SDK's vertex binding index) instead.
+        self.ssbo = ssbo
+        self.needs_ssbo = False
+        self.ssbo_bindings = {}  # fetch slot -> storage buffer binding (first-use order, as the SDK numbers them)
+        self.ssbo_addr = None    # GLSL variable with the word address of the last vfetch_full
         self.lines = text.splitlines()
         self.body = []        # GLSL statements of the current block
         self.blocks = []      # (cf_index, kind, statements, extra) in order
@@ -165,8 +176,13 @@ class Translator:
         kv = {}
         slot = None
         pos = 1
+        index = None
         if op == 'vfetch_full':
-            self.parse_source(parts[1], 1)  # the index register (r0.x): the host supplies vertex ids
+            # The index register: the untouched r0.x is the vertex id (the host supplies the attribute), anything
+            # else is a computed index and needs the storage buffer path.
+            if parts[1] != 'r0.x' or 'x' in self.written.get(0, set()):
+                self.needs_ssbo = True
+            index = self.parse_source(parts[1], 1)
         target, comps = self.parse_result(parts[0])
         if op == 'vfetch_full':
             if not parts[2].startswith('vf'):
@@ -182,11 +198,24 @@ class Translator:
         if op == 'vfetch_full':
             self.cur_slot = slot
             self.stride_words = int(kv.get('Stride', '0'))
+            if self.ssbo:
+                # floor() as the SDK converts the float index (no shader here uses RoundIndex); a negative index
+                # wraps to a huge word address and reads as zero through the bounds check. Set even for a
+                # constants-only fetch: the vfetch_mini after it adds its offset to this address.
+                self.ssbo_bindings.setdefault(slot, len(self.ssbo_bindings))
+                self.ssbo_addr = 'vfa_%d' % self.tmp_counter()
+                self.body.append('uint %s = uint(int(floor(%s))) * %du;' % (self.ssbo_addr, index, self.stride_words))
         if all(ch in (None, '0', '1') for ch in comps):
             # Only constants (vfetch_full r1.0001): the SDK lists no attribute for it, so none here either, or
             # every later in_a would sit one location after the data the backend binds (TMNT 0.48: the
             # sprites took their uv as position and the title screen stayed black).
             self.body.extend(self.write_masked(target, comps, 'vec4(0.0)', False))
+            return
+        if self.ssbo:
+            binding = self.ssbo_bindings[self.cur_slot]
+            value = self.ssbo_load(binding, '%s + %du' % (self.ssbo_addr, int(kv.get('Offset', '0'))),
+                                   kv.get('DataFormat', ''), kv.get('Signed') == 'true', kv.get('NumFormat') == 'integer')
+            self.body.extend(self.write_masked(target, comps, value, False))
             return
         attr = {
             'index': len(self.attrs),
@@ -201,6 +230,32 @@ class Translator:
         self.attrs.append(attr)
         var = 'in_%d' % attr['index']
         self.body.extend(self.write_masked(target, comps, var, False))
+
+    def ssbo_load(self, binding, addr, fmt, signed, integer):
+        """vec4 expression reading one vertex record field from storage buffer `binding` at word `addr`; missing
+        components read 0, w reads 1 (as a vertex attribute does). The words are host order (CopySwapBlock)."""
+        w = lambda i: 'vf%d_w(%s + %du)' % (binding, addr, i)
+        f = lambda i: 'uintBitsToFloat(%s)' % w(i)
+        if fmt == 'FMT_32_FLOAT':
+            return 'vec4(%s, 0.0, 0.0, 1.0)' % f(0)
+        if fmt == 'FMT_32_32_FLOAT':
+            return 'vec4(%s, %s, 0.0, 1.0)' % (f(0), f(1))
+        if fmt == 'FMT_32_32_32_FLOAT':
+            return 'vec4(%s, %s, %s, 1.0)' % (f(0), f(1), f(2))
+        if fmt == 'FMT_32_32_32_32_FLOAT':
+            return 'vec4(%s, %s, %s, %s)' % (f(0), f(1), f(2), f(3))
+        if fmt == 'FMT_16_16_FLOAT':
+            return 'vec4(unpackHalf2x16(%s), 0.0, 1.0)' % w(0)
+        if fmt == 'FMT_16_16_16_16_FLOAT':
+            return 'vec4(unpackHalf2x16(%s), unpackHalf2x16(%s))' % (w(0), w(1))
+        if fmt == 'FMT_8_8_8_8':
+            # The same decode as the attribute path (VertexAttribOf): integer -> scaled, else normalized.
+            if integer and signed:
+                return 'vec4(ivec4(int(%s << 24) >> 24, int(%s << 16) >> 24, int(%s << 8) >> 24, int(%s) >> 24))' % (w(0), w(0), w(0), w(0))
+            if integer:
+                return 'vec4(uvec4(%s & 255u, (%s >> 8) & 255u, (%s >> 16) & 255u, %s >> 24))' % (w(0), w(0), w(0), w(0))
+            return '%s(%s)' % ('unpackSnorm4x8' if signed else 'unpackUnorm4x8', w(0))
+        self.err('indexed vertex fetch of %s is not supported' % fmt)
 
     def emit_fetch_texture(self, op, rest):
         # tfetch2D r0, r0.xy, tf0[, FetchValidOnly=false, ...]
@@ -259,11 +314,10 @@ class Translator:
             self.body.append('vec4 %s = textureLod(tf_%d, %s, 0.0);' % (tmp, slot, coord))
         self.body.extend(self.write_masked(target, comps, tmp, False))
 
-    _tmp = 0
-
     def tmp_counter(self):
-        Translator._tmp += 1
-        return Translator._tmp
+        # Per translation: the output of a shader does not depend on what was translated before it.
+        self._tmp = getattr(self, '_tmp', 0) + 1
+        return self._tmp
 
     def vector_expr(self, op, a):
         """GLSL expression (vec4) of a vector op with operand expressions a[0..2]."""
@@ -575,6 +629,9 @@ class Translator:
             for a in self.attrs:
                 out.append('layout(location = %d) in vec4 in_%d;  // vf%d offset %d %s' % (
                     a['index'], a['index'], a['slot'], a['offset_words'], a['format']))
+            for slot, b in sorted(self.ssbo_bindings.items(), key=lambda kv: kv[1]):
+                out.append('layout(std430, binding = %d) readonly buffer Vf%d { uint w[]; } vf%d;  // vf%d' % (b, b, b, slot))
+                out.append('uint vf%d_w(uint a) { return a < uint(vf%d.w.length()) ? vf%d.w[a] : 0u; }' % (b, b, b))
         else:
             for k in sorted(self.reads_before_write):
                 out.append('layout(location = %d) in vec4 i_%d;' % (k, k))
@@ -612,6 +669,8 @@ class Translator:
         for i in range(self.max_reg + 1):
             if self.stage == 'frag' and i in self.reads_before_write:
                 out.append(ind + 'vec4 r%d = i_%d;' % (i, i))
+            elif self.stage == 'vert' and i == 0 and self.ssbo:
+                out.append(ind + 'vec4 r0 = vec4(float(gl_VertexID), 0.0, 0.0, 0.0);  // the vertex index')
             else:
                 out.append(ind + 'vec4 r%d = vec4(0.0);' % i)
         for e in sorted(self.exports):
@@ -716,6 +775,7 @@ class Translator:
             'textures': {str(k): v for k, v in sorted(self.textures.items())},
             'interpolators': interps, 'inputs': sorted(self.reads_before_write) if self.stage == 'frag' else [],
             'colors': colors, 'has_jump': self.has_jump, 'uses_bools': self.uses_bools, 'kill': self.has_kill,
+            'ssbo': self.ssbo,
         }
         return '\n'.join(out) + '\n', meta
 
@@ -752,7 +812,12 @@ def translate_file(path):
         raise SystemExit('%s: name must end in .vert or .frag' % path)
     name = os.path.basename(path).replace('.ucode.', '.')
     text = open(path, encoding='utf-8').read()
-    return Translator(text, stage, name).translate()
+    t = Translator(text, stage, name)
+    glsl, meta = t.translate()
+    if t.needs_ssbo:
+        # A computed fetch index somewhere: every stream of this shader goes through storage buffers.
+        glsl, meta = Translator(text, stage, name, ssbo=True).translate()
+    return glsl, meta
 
 
 def uam_check(glsl_path, stage):
@@ -788,6 +853,9 @@ def main():
             dst = os.path.join(args.out_dir or args.all, stem + '.glsl')
             open(dst, 'w', newline='\n').write(glsl)
             open(dst.replace('.glsl', '.json'), 'w', newline='\n').write(json.dumps(meta, indent=1))
+            if meta.get('ssbo'):
+                # Marker for the backend (staged next to the DKSH): bind the streams as storage buffers.
+                open(dst.replace('.glsl', '.ssbo'), 'w').close()
             if args.check:
                 good, msg = uam_check(dst, meta['stage'])
                 print('%s %s%s' % ('OK  ' if good else 'FAIL', stem, '' if good else ': ' + msg))

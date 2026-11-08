@@ -201,6 +201,7 @@ class DkShaderObj : public Shader {
   bool loaded = false;
   DkShader geom{};           // vertex shaders: the rectangle-list geometry shader
   bool geom_loaded = false;
+  bool ssbo = false;         // vertex shaders: computed fetch indices; the streams are storage buffers (xenos2glsl .ssbo)
 };
 
 struct SysConstants {
@@ -558,6 +559,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
       std::snprintf(name, sizeof(name), "%sshader_%016llX.geom.dksh", shader_dir_.c_str(), (unsigned long long)hash);
       shader->geom_loaded = LoadDksh(name, shader->geom);
       if (!shader->geom_loaded) LogOnce("geom", "no rectangle-list geometry shader for VS %016llX (%s)", (unsigned long long)hash, name);
+      std::snprintf(name, sizeof(name), "%sshader_%016llX.vert.ssbo", shader_dir_.c_str(), (unsigned long long)hash);
+      shader->ssbo = access(name, F_OK) == 0;
+      if (shader->ssbo) Log("VS %016llX fetches by computed indices: storage buffers", (unsigned long long)hash);
     }
     if (!shader->loaded) {
       missing_shaders_++;
@@ -841,7 +845,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // Vertex layout and data: one buffer per fetch constant the vertex shader uses.
     DkVtxAttribState attribs[DK_MAX_VERTEX_ATTRIBS];
     DkVtxBufferState buffers[DK_MAX_VERTEX_BUFFERS];
-    uint32_t attrib_count = 0, buffer_count = 0;
+    uint32_t attrib_count = 0, buffer_count = 0, ssbo_count = 0;
     uint32_t vertex_count = index_count;
     uint32_t index_offset = UINT32_MAX;
     uint32_t restart_index = regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx;
@@ -897,10 +901,17 @@ class Deko3dCommandProcessor : public CommandProcessor {
                 stride, bytes, vb.fetch_constant, avail, (unsigned long long)vs->ucode_data_hash());
         bytes = avail;
       }
-      uint32_t off = f.data.Alloc(bytes ? bytes : 16, 64);
+      uint32_t off = f.data.Alloc(bytes ? bytes : 16, 256);
       if (off == UINT32_MAX) { LogOnce("ring", "frame data ring full"); skipped_++; return true; }
       const uint8_t* src = memory_->TranslatePhysical(fetch.address << 2);
       texture_conversion::CopySwapBlock(fetch.endian, f.data.cpu + off, src, bytes);
+      if (vs->ssbo) {
+        // The shader computes its record addresses (floor(index) * stride + offset) and bounds-checks them against
+        // this size; every index it derives from the vertex id is at most the vertex id, so the per-vertex extent
+        // bounds the stream. Binding = the SDK's vertex binding index, the order xenos2glsl numbers the buffers.
+        dkCmdBufBindStorageBuffer(cmd, DkStage_Vertex, ssbo_count++, f.data.gpu + off, bytes);
+        continue;
+      }
       dkCmdBufBindVtxBuffer(cmd, buffer_count, f.data.gpu + off, bytes);
       buffers[buffer_count] = DkVtxBufferState{stride, 0};
       for (const auto& a : vb.attributes) {
