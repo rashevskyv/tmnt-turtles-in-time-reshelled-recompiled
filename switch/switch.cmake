@@ -96,7 +96,13 @@ target_link_options(tmnt PRIVATE
     -Wl,-u,vk_icdGetInstanceProcAddr
 )
 # zstd, expat and zlib from devkitPro portlibs (the SDK links them on Linux through the system).
-target_link_libraries(tmnt PRIVATE "${NVK_SDK}/lib/libvulkan.a" deko3d lz4 zstd expat z nx m stdc++)
+# deko3dd (the debug library) reports every error through the device's debug callback before it aborts; the release
+# library aborts silently (console 0.67: User Break 0x367 = DkResult_Fail with no message).
+set(TMNT_DEKO3D_LIB "deko3d" CACHE STRING "deko3d library to link: deko3d (release) or deko3dd (debug, error messages)")
+if(TMNT_DEKO3D_LIB STREQUAL "deko3dd")
+    target_compile_definitions(tmnt PRIVATE TMNT_DEKO3D_DEBUG_LIB=1)
+endif()
+target_link_libraries(tmnt PRIVATE "${NVK_SDK}/lib/libvulkan.a" ${TMNT_DEKO3D_LIB} lz4 zstd expat z nx m stdc++)
 # nx_create_nro ignores NAME/AUTHOR/VERSION: the NACP is generated here and handed to it.
 nx_generate_nacp(tmnt.nacp NAME "TMNT Re-Shelled" AUTHOR "tmnt-recomp" VERSION "${TMNT_VERSION}")
 # The hbmenu icon: the logo and title thumbnail from the player's own game files (tools/game_icon.py, switch/build.sh).

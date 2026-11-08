@@ -75,6 +75,7 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
     -DCMAKE_BUILD_TYPE=Release \
     -DREXSDK_DIR="$SDK" -DNVK_SDK="$NVK_SDK" -DTMNT_VERSION="$VERSION" -DTMNT_ICON="$ICON" \
+    -DTMNT_DEKO3D_LIB="${TMNT_DEKO3D_LIB:-deko3dd}" \
     -DREXGLUE_ENABLE_TRACY=OFF -DREXGLUE_ENABLE_PERF_COUNTERS=ON > "$BUILD/configure.log" 2>&1 \
     || { tail -20 "$BUILD/configure.log"; exit 1; }
 # A failed build must not leave the previous NRO behind for deploy.sh.

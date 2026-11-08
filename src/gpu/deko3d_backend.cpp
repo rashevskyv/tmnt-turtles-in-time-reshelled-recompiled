@@ -28,6 +28,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -137,9 +138,13 @@ void Log(const char* fmt, ...) {
   std::fflush(stdout);
 }
 
+// Set by the backend: writes the GPU checkpoint reports of the frames in flight (the abort follows the callback).
+std::function<void(const char*)> g_dk_fault_dump;
+
 void DebugCallback(void*, const char* context, DkResult result, const char* message) {
   Log("deko3d %s: result %d: %s", context ? context : "?", int(result), message ? message : "");
   std::fflush(stdout);  // deko3d aborts right after an error (console 0.56: the message was lost)
+  if (g_dk_fault_dump) g_dk_fault_dump(context ? context : "deko3d error");
 }
 
 struct MemBlock {
@@ -181,6 +186,7 @@ struct HostImage {
   bool is_depth = false;
   uint32_t flags = 0;         // gh: the layout flags (a recycled image must match)
   bool from_resolve = false;  // host-native channels: the fetch swizzle is not applied
+  bool rb_swapped = false;    // resolved with RB_COPY_DEST_INFO swap: the fetch swizzle IS applied (see the bind)
   bool reversed_channels = false;  // the format stores the Xenos channels in reverse order (4-4-4-4)
   uint32_t content_serial = 0;  // the draw serial when the contents were set (upload or resolve); 0 = never
   uint64_t mem_hash = 0;        // Linux (no dirty bytes): hash of the guest memory when the contents were set
@@ -498,6 +504,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
     dump_images_ = access((debug_dir + "dk_dump").c_str(), F_OK) == 0;  // readback dumps stall the GPU: debug only
     debug_dir_ = debug_dir;
     gpu_checkpoints_ = access((debug_dir + "dk_gpu_checkpoints").c_str(), F_OK) == 0;
+#ifdef TMNT_DEKO3D_DEBUG_LIB
+    Log("deko3d debug library (deko3dd): errors are reported through the debug callback before the abort");
+#endif
+    g_dk_fault_dump = [this](const char* why) { DumpFencedFrames(why); };
     if (gpu_checkpoints_) {
       Log("GPU checkpoints enabled; dk_skip is ignored");
       for (Frame& f : frames_) {
@@ -709,7 +719,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
                 tex->resolve_pitch, tex->resolve_height, tex->resolve_format, tex->resolve_endian, split_candidate);
       }
       if (split_candidate) ComposeAdjacentResolve(f, *tex);
-      uint32_t swizzle = tex->from_resolve ? 0 : fetch.swizzle;
+      // Resolve images hold host-native channels: fetch 60A (the Xenos resolve byte order) is the identity. A
+      // red/blue-swapped resolve undoes that: 60A then means BGRA, 688 means identity, i.e. the fetch swizzle itself.
+      uint32_t swizzle = tex->from_resolve && !tex->rb_swapped ? 0 : fetch.swizzle;
       if (swizzle && tex->reversed_channels) {
         uint32_t r = 0;
         for (uint32_t i = 0; i < 4; i++) {
@@ -1178,10 +1190,14 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (gpu_checkpoints_ && f.ts_off != UINT32_MAX)
       dkCmdBufReportCounter(cmd, DkCounter_Timestamp, f.data.gpu + f.ts_off + 16);
     DkCmdList list = dkCmdBufFinishList(cmd);
+    // Console 0.67 crash report: DkResult_Fail raised by the queue flush inside dkQueuePresentImage (the channel was
+    // already in error from this frame's earlier work) aborted the process before any checkpoint report. Dump first.
+    if (dkQueueIsInErrorState(queue_)) DumpFencedFrames("queue in error state before submit");
     dkQueueSubmitCommands(queue_, list);
     dkQueueSignalFence(queue_, &f.fence, false);
     f.checkpoint_swap = swaps_ + 1;
     f.fenced = true;
+    if (dkQueueIsInErrorState(queue_)) DumpFencedFrames("queue in error state before present");
     dkQueuePresentImage(queue_, swapchain_, slot);
     // Shown-frame intervals: what the screen gets (the [nx] fps line counts guest swaps).
     const double shown_now = NowMs();
@@ -1412,9 +1428,21 @@ class Deko3dCommandProcessor : public CommandProcessor {
     dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, 0);
     dkCmdBufReportCounter(f.cmdbuf, DkCounter_Timestamp, f.checkpoint_data.gpu + index * 16);
   }
-  void ReportCheckpoints(const Frame& f, bool pending = false) {
+  // Every frame in flight, one file each (dk_gpu_fault_<frame>.txt): called from the deko3d error callback and
+  // when the queue is found in error state. No deko3d calls here: the library may be in its error path.
+  void DumpFencedFrames(const char* why) {
+    Log("GPU fault dump: %s", why);
+    for (uint32_t i = 0; i < kFrames; i++) {
+      if (!frames_[i].fenced) continue;
+      char name[48];
+      std::snprintf(name, sizeof(name), "dk_gpu_fault_%u.txt", i);
+      ReportCheckpoints(frames_[i], true, name);
+    }
+    std::fflush(stdout);
+  }
+  void ReportCheckpoints(const Frame& f, bool pending = false, const char* name = nullptr) {
     if (!pending && gpu_reported_) return;
-    const char* name = pending ? "dk_gpu_pending.txt" : "dk_gpu_fault.txt";
+    if (!name) name = pending ? "dk_gpu_pending.txt" : "dk_gpu_fault.txt";
     FILE* out = std::fopen((debug_dir_ + name).c_str(), "w");
     if (!out) { Log("GPU checkpoint report could not be opened"); return; }
     if (pending) std::fprintf(out, "Live snapshot after 120 busy skips; the GPU may still be running. Reports may change while read.\n");
@@ -1873,7 +1901,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     DkImageFormat format;
     bool reversed;
     if (!TextureFormatOf(info.format, format, reversed)) {
-      LogOnce((std::string("tfmt ") + info.format_info()->name).c_str(), "unsupported texture format %s", info.format_info()->name);
+      LogOnce((std::string("tfmt ") + info.format_info()->name).c_str(), "unsupported texture format %s at %08X (%ux%u, swizzle %03X)",
+              info.format_info()->name, info.memory.base_address, info.width + 1, info.height + 1, fetch.swizzle);
       return nullptr;
     }
     // TextureInfo keeps the fetch constant's fields: the size minus one.
@@ -1897,6 +1926,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
                                img->from_resolve ? "was a resolve destination" : "was uploaded before", img->width, img->height);
     }
     img->from_resolve = false;
+    img->rb_swapped = false;
     img->resolve_pitch = img->resolve_height = 0;
     img->content_serial = serial_;
     img->mem_bytes = src.bytes;
@@ -2279,11 +2309,11 @@ class Deko3dCommandProcessor : public CommandProcessor {
     const bool packed = src->format == DkImageFormat_RGB10A2_Unorm &&
                         src_format == xenos::ColorRenderTargetFormat::k_2_10_10_10 &&
                         xenos::IsColorResolveFormatBitwiseEquivalent(src_format, info.copy_dest_info.copy_dest_format) &&
-                        !info.copy_dest_info.copy_dest_exp_bias && !info.copy_dest_info.copy_dest_swap;
+                        !info.copy_dest_info.copy_dest_exp_bias;
     if (!packed && src->format != DkImageFormat_RGBA8_Unorm && src->format != DkImageFormat_RGBA8_Unorm_sRGB) {
-      LogOnce("resolvefmt", "color resolve EDRAM %u format %u to format %u bias %d swap %u is unsupported", info.color_edram_info.base_tiles,
+      LogOnce("resolvefmt", "color resolve EDRAM %u format %u to format %u bias %d swap %u -> %08X is unsupported", info.color_edram_info.base_tiles,
               uint32_t(src_format), uint32_t(info.copy_dest_info.copy_dest_format), info.copy_dest_info.copy_dest_exp_bias,
-              info.copy_dest_info.copy_dest_swap);
+              info.copy_dest_info.copy_dest_swap, info.copy_dest_base);
       if (info.IsClearingColor()) {
         BindTargets(cmd, src, nullptr);
         DkScissor sc{x, y, x < src->width ? std::min(w, src->width - x) : 0,
@@ -2304,6 +2334,11 @@ class Deko3dCommandProcessor : public CommandProcessor {
                                 packed ? DkImageFormat_RGB10A2_Unorm : DkImageFormat_RGBA8_Unorm, true);
     if (!dst) return true;
     dst->from_resolve = true;
+    // RB_COPY_DEST_INFO swap exchanges R and B in the written texels. The image keeps the target's channels, so the
+    // consumer's fetch swizzle is applied as-is at the bind (the usual resolve identity convention stands for 60A).
+    dst->rb_swapped = info.copy_dest_info.copy_dest_swap != 0;
+    if (dst->rb_swapped) LogOnce("resolveswap", "resolve EDRAM %u format %u -> %08X with red/blue swap", info.color_edram_info.base_tiles,
+                                 uint32_t(src_format), info.copy_dest_base);
     dst->content_serial = serial_;
     dst->resolve_pitch = dst->resolve_height = dst->composed_child_serial = 0;
     dst->mem_bytes = dest_pitch * dest_height * 4;
