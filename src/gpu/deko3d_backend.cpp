@@ -2343,8 +2343,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // RB_COPY_DEST_INFO swap exchanges R and B in the written texels. The image keeps the target's channels, so the
     // consumer's fetch swizzle is applied as-is at the bind (the usual resolve identity convention stands for 60A).
     dst->rb_swapped = info.copy_dest_info.copy_dest_swap != 0;
-    if (dst->rb_swapped) LogOnce("resolveswap", "resolve EDRAM %u format %u -> %08X with red/blue swap", info.color_edram_info.base_tiles,
-                                 uint32_t(src_format), info.copy_dest_base);
+    if (dst->rb_swapped) {
+      char key[32];
+      std::snprintf(key, sizeof key, "resolveswap %08X", info.copy_dest_base);
+      LogOnce(key, "resolve EDRAM %u format %u -> %08X with red/blue swap", info.color_edram_info.base_tiles,
+              uint32_t(src_format), info.copy_dest_base);
+    }
     dst->content_serial = serial_;
     dst->resolve_pitch = dst->resolve_height = dst->composed_child_serial = 0;
     dst->mem_bytes = dest_pitch * dest_height * 4;
