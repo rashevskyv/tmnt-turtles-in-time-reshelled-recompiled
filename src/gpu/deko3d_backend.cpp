@@ -191,7 +191,7 @@ struct HostImage {
   bool is_depth = false;
   uint32_t flags = 0;         // gh: the layout flags (a recycled image must match)
   bool from_resolve = false;  // host-native channels: the fetch swizzle is not applied
-  bool rb_swapped = false;    // resolved with RB_COPY_DEST_INFO swap: the fetch swizzle IS applied (see the bind)
+  bool rb_swapped = false;    // resolved with RB_COPY_DEST_INFO swap: the fetch swizzle with red and blue exchanged
   bool depth_resolve = false; // an R32F copy of a depth target (ResolveDepth): the k_24_8 / k_24_8_FLOAT texture
   bool reversed_channels = false;  // the format stores the Xenos channels in reverse order (4-4-4-4)
   uint32_t content_serial = 0;  // the draw serial when the contents were set (upload or resolve); 0 = never
@@ -426,6 +426,20 @@ DkImageSwizzle SwizzleOf(uint32_t s) {
     case 4: return DkImageSwizzle_Zero;
     default: return DkImageSwizzle_One;
   }
+}
+
+// The view swizzle of a resolve image. The image holds the render target's channels. A resolve with
+// RB_COPY_DEST_INFO swap writes red and blue exchanged, so the fetch swizzle with its red and blue sources
+// exchanged reads them back: 60A gives the identity (0), as the SDK's SwapRedBlueSwizzle does. Without the swap
+// (only the depth resolves in this game): the identity.
+uint32_t ResolveSwizzle(bool rb_swapped, uint32_t fetch_swizzle) {
+  if (!rb_swapped) return 0;
+  uint32_t r = 0;
+  for (uint32_t i = 0; i < 4; i++) {
+    uint32_t c = (fetch_swizzle >> (3 * i)) & 7;
+    r |= (c == 0 ? 2 : c == 2 ? 0 : c) << (3 * i);
+  }
+  return r == 0x688 ? 0 : r;
 }
 
 class Deko3dCommandProcessor : public CommandProcessor {
@@ -703,7 +717,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
         // Not through the per-frame bind cache: CubeImage checks its 6 x levels sources itself.
         TextureInfo info;
         HostImage* tex = TextureInfo::Prepare(fetch, &info) ? CubeImage(f, info, fetch) : nullptr;
-        uint32_t slot = tex ? DescriptorFor(f, tex, tex->from_resolve && !tex->rb_swapped ? 0 : fetch.swizzle) : UINT32_MAX;
+        uint32_t slot = tex ? DescriptorFor(f, tex, tex->from_resolve ? ResolveSwizzle(tex->rb_swapped, fetch.swizzle) : fetch.swizzle) : UINT32_MAX;
         if (slot == UINT32_MAX) { textures_ok = false; continue; }
         DkResHandle handle = dkMakeTextureHandle(slot, kCubeSampler);
         dkCmdBufBindTextures(cmd, DkStage_Fragment, tb.fetch_constant, &handle, 1);
@@ -756,9 +770,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
                 tex->resolve_pitch, tex->resolve_height, tex->resolve_format, tex->resolve_endian, split_candidate);
       }
       if (split_candidate) ComposeAdjacentResolve(f, *tex);
-      // Resolve images hold host-native channels: fetch 60A (the Xenos resolve byte order) is the identity. A
-      // red/blue-swapped resolve undoes that: 60A then means BGRA, 688 means identity, i.e. the fetch swizzle itself.
-      uint32_t swizzle = tex->from_resolve && !tex->rb_swapped ? 0 : fetch.swizzle;
+      uint32_t swizzle = tex->from_resolve ? ResolveSwizzle(tex->rb_swapped, fetch.swizzle) : fetch.swizzle;
       if (swizzle && tex->reversed_channels) {
         uint32_t r = 0;
         for (uint32_t i = 0; i < 4; i++) {
@@ -2735,8 +2747,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (!dst) return true;
     dst->from_resolve = true;
     dst->depth_resolve = false;
-    // RB_COPY_DEST_INFO swap exchanges R and B in the written texels. The image keeps the target's channels, so the
-    // consumer's fetch swizzle is applied as-is at the bind (the usual resolve identity convention stands for 60A).
+    // RB_COPY_DEST_INFO swap exchanges R and B in the written texels. The image keeps the target's channels: see
+    // ResolveSwizzle for the bind.
     dst->rb_swapped = info.copy_dest_info.copy_dest_swap != 0;
     if (dst->rb_swapped) {
       char key[32];
