@@ -716,7 +716,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
                                    info.dimension == xenos::DataDimension::k2DOrStacked && !info.is_stacked &&
                                    info.memory.base_address == tex->guest_base && info.pitch == tex->width &&
                                    info.format_info()->bytes_per_block() == 4 &&
-                                   uint32_t(info.format) == tex->resolve_format && uint32_t(info.endianness) == tex->resolve_endian;
+                                   ResolveFetchFormatMatches(tex->resolve_format, info.format) &&
+                                   uint32_t(info.endianness) == tex->resolve_endian;
       if (tex->resolve_height && tex->resolve_height < tex->height) {
         LogOnce("resolvepartscheck", "split fetch %08X %ux%u tiled %u pitch %u format %u endian %u; resolve pitch %u rows %u format %u endian %u eligible %u",
                 tex->guest_base, tex->width, tex->height, info.is_tiled, info.pitch, uint32_t(info.format), uint32_t(info.endianness),
@@ -1881,6 +1882,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       Checkpoint(f, "resize %08X %ux%u -> %ux%u copy %ux%u", base, img->width, img->height, resized->width, resized->height, cw, ch);
       dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
       resized->from_resolve = img->from_resolve;
+      resized->rb_swapped = img->rb_swapped;
       resized->content_serial = img->content_serial;
       resized->checked_serial = img->checked_serial;
       if (img->resolve_height && img->resolve_height < height) {
@@ -1907,6 +1909,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
     return img;
   }
 
+  static bool ResolveFetchFormatMatches(uint32_t resolved, xenos::TextureFormat fetched) {
+    using TF = xenos::TextureFormat;
+    return resolved == uint32_t(fetched) ||
+           (resolved == uint32_t(TF::k_2_10_10_10) && fetched == TF::k_2_10_10_10_AS_16_16_16_16);
+  }
+
   HostImage* TextureImage(Frame& f, const TextureInfo& info, const xenos::xe_gpu_texture_fetch_t& fetch) {
     DkImageFormat format;
     bool reversed;
@@ -1920,6 +1928,18 @@ class Deko3dCommandProcessor : public CommandProcessor {
     const TexSource src = SourceOf(info);
     if (src.level) frame_mip_only_ = true;
     const uint32_t base = src.address;
+    if (!src.level) {
+      auto it = guest_images_.find(base);
+      if (it != guest_images_.end()) {
+        HostImage* resolved = it->second;
+        if (resolved->from_resolve && resolved->resolve_height &&
+            ResolveFetchFormatMatches(resolved->resolve_format, info.format) &&
+            resolved->resolve_endian == uint32_t(fetch.endianness) &&
+            !MemoryChanged(*resolved, base, resolved->mem_bytes)) {
+          format = resolved->format;
+        }
+      }
+    }
     HostImage* img = GuestImage(f, base, src.width, src.height, format, false);
     if (!img) return nullptr;
     if (img->checked_serial == serial_) return img;
