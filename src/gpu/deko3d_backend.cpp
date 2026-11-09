@@ -734,14 +734,18 @@ class Deko3dCommandProcessor : public CommandProcessor {
       }
       HostImage* tex = TextureImage(f, info, fetch);
       if (!tex) { textures_ok = false; continue; }  // e.g. the staging ring is full this frame: draw next frame
-      const bool split_candidate = tex->from_resolve && info.is_tiled && tex->width > 32 && tex->height > 32 &&
+      // A depth resolve image holds host values (never guest bytes): the fetch's tiling, format and byte order
+      // say nothing about it, so the two slices of the scene depth compose whatever the fetch declares.
+      const bool split_candidate = tex->from_resolve && tex->width > 32 && tex->height > 32 &&
                                    info.dimension == xenos::DataDimension::k2DOrStacked && !info.is_stacked &&
                                    info.memory.base_address == tex->guest_base && info.pitch == tex->width &&
                                    info.format_info()->bytes_per_block() == 4 &&
-                                   ResolveFetchFormatMatches(tex->resolve_format, info.format) &&
-                                   uint32_t(info.endianness) == tex->resolve_endian;
+                                   (tex->depth_resolve || (info.is_tiled && ResolveFetchFormatMatches(tex->resolve_format, info.format) &&
+                                                           uint32_t(info.endianness) == tex->resolve_endian));
       if (tex->resolve_height && tex->resolve_height < tex->height) {
-        LogOnce("resolvepartscheck", "split fetch %08X %ux%u tiled %u pitch %u format %u endian %u; resolve pitch %u rows %u format %u endian %u eligible %u",
+        char pkey[40];
+        std::snprintf(pkey, sizeof(pkey), "resolvepartscheck %08X", tex->guest_base);
+        LogOnce(pkey, "split fetch %08X %ux%u tiled %u pitch %u format %u endian %u; resolve pitch %u rows %u format %u endian %u eligible %u",
                 tex->guest_base, tex->width, tex->height, info.is_tiled, info.pitch, uint32_t(info.format), uint32_t(info.endianness),
                 tex->resolve_pitch, tex->resolve_height, tex->resolve_format, tex->resolve_endian, split_candidate);
       }
@@ -1835,7 +1839,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     HostImage& child = *it->second;
     if (!child.from_resolve || child.resolve_frame != swaps_ || child.resolve_pitch != parent.resolve_pitch ||
         child.resolve_height != parent.height - parent.resolve_height || child.width != parent.width ||
-        child.height < child.resolve_height || child.format != parent.format || child.resolve_format != parent.resolve_format ||
+        child.height < child.resolve_height || child.format != parent.format || child.depth_resolve != parent.depth_resolve ||
+        child.resolve_format != parent.resolve_format ||
         child.resolve_endian != parent.resolve_endian || child.content_serial == parent.composed_child_serial ||
         MemoryChanged(child, child.guest_base, child.mem_bytes)) return;
     DkImageView sv, dv;
@@ -1849,8 +1854,11 @@ class Deko3dCommandProcessor : public CommandProcessor {
     parent.composed_child_serial = child.content_serial;
     parent.mem_bytes = uint32_t(child_base - parent.guest_base) + child.mem_bytes;
     parent.mem_hash = HashMemory(parent.guest_base, parent.mem_bytes);
-    LogOnce("resolveparts", "composed adjacent resolves %08X and %08X: %ux%u + %u rows",
-            parent.guest_base, child.guest_base, parent.width, parent.resolve_height, child.resolve_height);
+    char ckey[40];
+    std::snprintf(ckey, sizeof(ckey), "resolveparts %08X", parent.guest_base);
+    LogOnce(ckey, "composed adjacent resolves %08X and %08X: %ux%u + %u rows%s",
+            parent.guest_base, child.guest_base, parent.width, parent.resolve_height, child.resolve_height,
+            parent.depth_resolve ? " (depth)" : "");
   }
 
   // The image at a guest address (resolve destinations, textures). A fetch or a swap asks for the
