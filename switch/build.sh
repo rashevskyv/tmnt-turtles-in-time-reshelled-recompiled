@@ -95,6 +95,7 @@ mkdir -p "$STAGE/shaders"
 for s in vert frag; do
     uam -s $s -o "$STAGE/shaders/present.$s.dksh" "$SRC/src/gpu/shaders/present.$s"
 done
+uam -s frag -o "$STAGE/shaders/depthcopy.frag.dksh" "$SRC/src/gpu/shaders/depthcopy.frag"
 SHADER_DUMPS=${TMNT_SHADER_DUMPS:-$ROOT/shaders_trace}
 if [ -d "$SHADER_DUMPS" ]; then
     rm -rf "$BUILD/glsl"

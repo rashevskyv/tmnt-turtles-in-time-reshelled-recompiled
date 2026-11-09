@@ -121,7 +121,8 @@ constexpr uint32_t kStagingBytes = 96u << 20;
 constexpr uint32_t kImagePoolBytes = 448u << 20;
 constexpr uint32_t kCodePoolBytes = 4u << 20;
 constexpr uint32_t kMaxImageDescriptors = 512;
-constexpr uint32_t kSamplerCount = 512;  // see SamplerIndex: min, mag, border, clamp x, clamp y
+constexpr uint32_t kSamplerCount = 513;  // see SamplerIndex: min, mag, border, clamp x, clamp y; the last is kCubeSampler
+constexpr uint32_t kCubeSampler = 512;   // cube textures: linear with linear mips (the shaders pick the level: textureLod)
 constexpr uint32_t kPresentWidth = 1280;
 constexpr uint32_t kPresentHeight = 720;
 constexpr uint32_t kEdramTiles = 2048;  // 10 MB of 5120-byte tiles (80 x 16 x 32 bit)
@@ -191,6 +192,7 @@ struct HostImage {
   uint32_t flags = 0;         // gh: the layout flags (a recycled image must match)
   bool from_resolve = false;  // host-native channels: the fetch swizzle is not applied
   bool rb_swapped = false;    // resolved with RB_COPY_DEST_INFO swap: the fetch swizzle IS applied (see the bind)
+  bool depth_resolve = false; // an R32F copy of a depth target (ResolveDepth): the k_24_8 / k_24_8_FLOAT texture
   bool reversed_channels = false;  // the format stores the Xenos channels in reverse order (4-4-4-4)
   uint32_t content_serial = 0;  // the draw serial when the contents were set (upload or resolve); 0 = never
   uint64_t mem_hash = 0;        // Linux (no dirty bytes): hash of the guest memory when the contents were set
@@ -452,7 +454,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
                 gpu_cached ? "GPU-cached (0.258 behaviour)" : "GPU-uncached");
     if (!code_.Create(device_, kCodePoolBytes, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code) ||
         !images_.Create(device_, kImagePoolBytes, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image) ||
-        !descriptors_.Create(device_, DK_MEMBLOCK_ALIGNMENT * 4 * kFrames + DK_MEMBLOCK_ALIGNMENT * 2 + kSamplerCount * sizeof(DkSamplerDescriptor), ring_flags) ||
+        !descriptors_.Create(device_, DK_MEMBLOCK_ALIGNMENT * 4 * kFrames + DK_MEMBLOCK_ALIGNMENT * 2 +
+                             ((kSamplerCount * sizeof(DkSamplerDescriptor) + DK_MEMBLOCK_ALIGNMENT - 1) & ~size_t(DK_MEMBLOCK_ALIGNMENT - 1)), ring_flags) ||
         !cmdmem_.Create(device_, kFrameCmdBytes * kFrames, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached)) {
       Log("memory block creation failed");
       return false;
@@ -482,6 +485,11 @@ class Deko3dCommandProcessor : public CommandProcessor {
       s.wrapMode[0] = WrapModeOf(xenos::ClampMode((i >> 3) & 7));
       s.wrapMode[1] = WrapModeOf(xenos::ClampMode((i >> 6) & 7));
       s.wrapMode[2] = DkWrapMode_ClampToEdge;
+      if (i == kCubeSampler) {
+        s.minFilter = s.magFilter = DkFilter_Linear;
+        s.mipFilter = DkMipFilter_Linear;
+        s.wrapMode[0] = s.wrapMode[1] = DkWrapMode_ClampToEdge;
+      }
       float border = (i & 4) ? 1.0f : 0.0f;
       for (int c = 0; c < 4; c++) s.borderColor[c].value_f = border;
       DkSamplerDescriptor sd;
@@ -543,6 +551,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     present_vs_ = LoadDksh(shader_dir_ + "present.vert.dksh", present_vs_shader_);
     present_fs_ = LoadDksh(shader_dir_ + "present.frag.dksh", present_fs_shader_);
+    depth_fs_ = LoadDksh(shader_dir_ + "depthcopy.frag.dksh", depth_fs_shader_);
+    if (!depth_fs_) Log("no depthcopy.frag.dksh: depth resolves are ignored");
     Log("deko3d backend up: shaders from %s (%s present shaders), %u MB images, %u MB data per frame",
         shader_dir_.c_str(), present_vs_ && present_fs_ ? "with" : "WITHOUT", kImagePoolBytes >> 20, kFrameDataBytes >> 20);
     BeginFrame();
@@ -685,6 +695,18 @@ class Deko3dCommandProcessor : public CommandProcessor {
       const uint32_t* fw = reinterpret_cast<const uint32_t*>(&fetch);
       uint64_t bind_key = ps->ucode_data_hash() ^ (uint64_t(tb_index++) * 0x9E3779B97F4A7C15ull);
       for (int i = 0; i < 6; i++) bind_key = (bind_key ^ fw[i]) * 0x100000001B3ull;
+      if (fetch.dimension == xenos::DataDimension::kCube) {
+        // Not through the per-frame bind cache: CubeImage checks its 6 x levels sources itself.
+        TextureInfo info;
+        HostImage* tex = TextureInfo::Prepare(fetch, &info) ? CubeImage(f, info, fetch) : nullptr;
+        uint32_t slot = tex ? DescriptorFor(f, tex, tex->from_resolve && !tex->rb_swapped ? 0 : fetch.swizzle) : UINT32_MAX;
+        if (slot == UINT32_MAX) { textures_ok = false; continue; }
+        DkResHandle handle = dkMakeTextureHandle(slot, kCubeSampler);
+        dkCmdBufBindTextures(cmd, DkStage_Fragment, tb.fetch_constant, &handle, 1);
+        texset_key = (texset_key ^ info.memory.base_address) * 0x100000001B3ull + tb.fetch_constant;
+        if (tcount < 32) tnames[tcount++] = TexName{tb.fetch_constant, info.memory.base_address, tex->width, tex->height};
+        continue;
+      }
       if (auto it = f.texbinds.find(bind_key); it != f.texbinds.end()) {
         Frame::TexBind& c = it->second;
         HostImage* tex = c.tex;
@@ -1672,6 +1694,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
       if (r->width == width && r->height == height && r->format == format && r->flags == flags && r->is_depth == is_depth) {
         free_images_.erase(free_images_.begin() + i);
         r->from_resolve = false;
+        r->rb_swapped = false;
+        r->depth_resolve = false;
         r->content_serial = 0;
         r->checked_serial = 0;
         r->guest_base = 0;
@@ -1883,6 +1907,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
       resized->from_resolve = img->from_resolve;
       resized->rb_swapped = img->rb_swapped;
+      resized->depth_resolve = img->depth_resolve;
       resized->content_serial = img->content_serial;
       resized->checked_serial = img->checked_serial;
       if (img->resolve_height && img->resolve_height < height) {
@@ -1915,10 +1940,163 @@ class Deko3dCommandProcessor : public CommandProcessor {
            (resolved == uint32_t(TF::k_2_10_10_10) && fetched == TF::k_2_10_10_10_AS_16_16_16_16);
   }
 
+  // ----- cube textures --------------------------------------------------------------------------
+  // Eden 0.73: "texture fetch 1 not preparable or not 1D/2D (dim 3)": the ambient lighting draw (PS B1581472F8E5082B)
+  // and the probe filter passes sample cube textures and were skipped. The game renders its reflection probes face
+  // by face and level by level and resolves each to its own address inside the cube (128x128 faces at
+  // 1DEFD000 + n * 0x10000, then 64, 32, 16 and 8 texel levels after them). A cube image is 6 layers with every
+  // stored level; each face of each level is copied from the resolve image at its guest address, or, for a cube
+  // with no resolve image at its first face, uploaded from guest memory.
+  struct CubeTex {
+    HostImage* img = nullptr;
+    uint32_t size = 0, levels = 0;
+    bool from_memory = false;
+    uint32_t checked_serial = 0;
+    std::vector<uint32_t> part_serial;  // [level * 6 + face]: the source's content serial at the copy; 0 = never filled
+  };
+  std::unordered_map<uint32_t, CubeTex> cubes_;
+
+  HostImage* CreateCube(uint32_t size, uint32_t levels, DkImageFormat format) {
+    auto* img = new HostImage();
+    DkImageLayoutMaker lm;
+    dkImageLayoutMakerDefaults(&lm, device_);
+    lm.type = DkImageType_Cubemap;
+    lm.flags = 0;
+    lm.format = format;
+    lm.dimensions[0] = lm.dimensions[1] = size;
+    lm.dimensions[2] = 6;
+    lm.mipLevels = levels;
+    dkImageLayoutInitialize(&img->layout, &lm);
+    uint64_t bytes = dkImageLayoutGetSize(&img->layout);
+    uint32_t off = images_.Alloc(uint32_t(bytes), dkImageLayoutGetAlignment(&img->layout));
+    if (off == UINT32_MAX) {
+      Log("image pool full (%u MB used): cube %ux%u not created", images_.used >> 20, size, size);
+      delete img;
+      return nullptr;
+    }
+    dkImageInitialize(&img->image, &img->layout, images_.block, off);
+    img->format = format;
+    img->width = img->height = size;
+    image_count_++;
+    return img;
+  }
+
+  HostImage* CubeImage(Frame& f, const TextureInfo& info, const xenos::xe_gpu_texture_fetch_t& fetch) {
+    const uint32_t size = info.width + 1;
+    const uint32_t base = info.memory.base_address;
+    if (!base || info.height + 1 != size) {
+      LogOnce("cubebase", "cube texture without a base level or not square: base %08X mips %08X %ux%u", base, info.memory.mip_address,
+              size, info.height + 1);
+      return nullptr;
+    }
+    uint32_t levels = info.mip_max_level + 1;
+    while (levels > 1 && !(size >> (levels - 1))) levels--;
+    const auto layout = texture_util::GetGuestTextureLayout(xenos::DataDimension::kCube, info.pitch >> 5, size, size, 6, info.is_tiled,
+                                                            info.format, info.has_packed_mips, true, levels - 1);
+    auto part_address = [&](uint32_t level, uint32_t face) {
+      if (!level) return base + face * layout.base.array_slice_stride_bytes;
+      const uint32_t stored = std::min(level, layout.packed_level);
+      return info.memory.mip_address + layout.mip_offsets_bytes[stored] + face * layout.mips[stored].array_slice_stride_bytes;
+    };
+    // The resolve image of a face (not for the levels of the packed tail: they share one address).
+    auto resolve_at = [&](uint32_t level, uint32_t face) -> HostImage* {
+      if (level >= layout.packed_level) return nullptr;
+      auto it = guest_images_.find(part_address(level, face));
+      if (it == guest_images_.end()) return nullptr;
+      HostImage* r = it->second;
+      const uint32_t lw = std::max(1u, size >> level);
+      return r->from_resolve && !r->depth_resolve && r->content_serial && r->width >= lw && r->height >= lw ? r : nullptr;
+    };
+    HostImage* first = resolve_at(0, 0);
+    DkImageFormat format;
+    bool reversed = false;
+    if (first) {
+      format = first->format;
+    } else if (!TextureFormatOf(info.format, format, reversed)) {
+      LogOnce((std::string("tfmt ") + info.format_info()->name).c_str(), "unsupported texture format %s at %08X (cube %ux%u, swizzle %03X)",
+              info.format_info()->name, base, size, size, fetch.swizzle);
+      return nullptr;
+    }
+    CubeTex& cube = cubes_[base];
+    if (!cube.img || cube.size != size || cube.levels != levels || cube.img->format != format) {
+      // ponytail: a replaced cube's pool memory is not reclaimed (bump pool); a free list if a stage ever cycles them.
+      HostImage* img = CreateCube(size, levels, format);
+      if (!img) return nullptr;
+      img->guest_base = base;
+      cube = CubeTex{img, size, levels, !first, 0, std::vector<uint32_t>(levels * 6)};
+      Log("cube texture at %08X: %s %ux%u %s endian %u swizzle %03X, %u levels (fetch mips %u-%u at %08X, packed %u from level %u), "
+          "face stride %u bytes, level 1 at %08X, filled from %s (host format %u)",
+          base, info.format_info()->name, size, size, info.is_tiled ? "tiled" : "linear", uint32_t(fetch.endianness), fetch.swizzle, levels,
+          info.mip_min_level, info.mip_max_level, info.memory.mip_address, info.has_packed_mips, layout.packed_level,
+          layout.base.array_slice_stride_bytes, levels > 1 ? part_address(1, 0) : 0, first ? "resolve images" : "guest memory",
+          uint32_t(format));
+    }
+    HostImage* img = cube.img;
+    if (cube.checked_serial == serial_) return img;
+    cube.checked_serial = serial_;
+    img->reversed_channels = reversed;
+    const uint32_t bpb = info.format_info()->bytes_per_block();
+    uint32_t missing = 0;
+    for (uint32_t level = 0; level < levels; level++) {
+      const uint32_t lw = std::max(1u, size >> level);
+      for (uint32_t face = 0; face < 6; face++) {
+        uint32_t& filled = cube.part_serial[level * 6 + face];
+        if (!cube.from_memory) {
+          HostImage* r = resolve_at(level, face);
+          if (!r || r->format != format) { if (!filled) missing++; continue; }
+          if (r->content_serial == filled) continue;
+          DkImageView sv, dv;
+          dkImageViewDefaults(&sv, &r->image);
+          dkImageViewDefaults(&dv, &img->image);
+          dv.mipLevelOffset = uint8_t(level);
+          DkImageRect sr{0, 0, 0, lw, lw, 1}, dr{0, 0, face, lw, lw, 1};
+          dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
+          dkCmdBufCopyImage(f.cmdbuf, &sv, &sr, &dv, &dr, 0);
+          Checkpoint(f, "cube %08X level %u face %u from resolve %08X %ux%u", base, level, face, r->guest_base, lw, lw);
+          dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
+          filled = r->content_serial;
+          img->from_resolve = true;
+          img->rb_swapped = r->rb_swapped;
+        } else {
+          const uint32_t stored = std::min(level, layout.packed_level);
+          const auto& ll = level ? layout.mips[stored] : layout.base;
+          TexSource s{part_address(level, face), ll.array_slice_data_extent_bytes, lw, lw, ll.row_pitch_bytes / bpb, 0, 0, level};
+          if (filled && !WrittenSince(s.address, s.bytes, filled)) continue;
+          uint32_t oz = 0;
+          if (level >= layout.packed_level) texture_util::GetPackedMipOffset(size, size, 1, info.format, level, s.ox, s.oy, oz);
+          if (!UploadTexture(f, *img, info, s, fetch.endianness, face, level)) { if (!filled) missing++; continue; }
+          filled = serial_;
+        }
+      }
+    }
+    if (missing) {
+      char key[40];
+      std::snprintf(key, sizeof(key), "cubemissing %08X %u", base, missing);
+      LogOnce(key, "cube texture at %08X: %u of %u faces not filled yet", base, missing, levels * 6);
+    }
+    return img;
+  }
+
   HostImage* TextureImage(Frame& f, const TextureInfo& info, const xenos::xe_gpu_texture_fetch_t& fetch) {
     DkImageFormat format;
     bool reversed;
-    if (!TextureFormatOf(info.format, format, reversed)) {
+    if (info.format == xenos::TextureFormat::k_24_8 || info.format == xenos::TextureFormat::k_24_8_FLOAT) {
+      // The scene depth: only as the R32F copy a depth resolve made (guest memory holds no depth: nothing to upload).
+      auto it = guest_images_.find(info.memory.base_address);
+      char key[40];
+      std::snprintf(key, sizeof(key), "depthtex %08X", info.memory.base_address);
+      if (it == guest_images_.end() || !it->second->depth_resolve) {
+        LogOnce(key, "depth texture %s at %08X (%ux%u, swizzle %03X) has no depth resolve image: draw skipped",
+                info.format_info()->name, info.memory.base_address, info.width + 1, info.height + 1, fetch.swizzle);
+        return nullptr;
+      }
+      std::snprintf(key, sizeof(key), "depthtex ok %08X", info.memory.base_address);
+      LogOnce(key, "depth texture %s at %08X (%ux%u, swizzle %03X): the depth resolve image %ux%u",
+              info.format_info()->name, info.memory.base_address, info.width + 1, info.height + 1, fetch.swizzle,
+              it->second->width, it->second->height);
+      format = DkImageFormat_R32_Float;
+      reversed = false;
+    } else if (!TextureFormatOf(info.format, format, reversed)) {
       LogOnce((std::string("tfmt ") + info.format_info()->name).c_str(), "unsupported texture format %s at %08X (%ux%u, swizzle %03X)",
               info.format_info()->name, info.memory.base_address, info.width + 1, info.height + 1, fetch.swizzle);
       return nullptr;
@@ -1942,6 +2120,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     HostImage* img = GuestImage(f, base, src.width, src.height, format, false);
     if (!img) return nullptr;
+    if (img->depth_resolve) return img;  // never uploaded from guest memory
     if (img->checked_serial == serial_) return img;
     img->reversed_channels = reversed;  // already checked for this draw
     img->checked_serial = serial_;
@@ -1957,6 +2136,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     img->from_resolve = false;
     img->rb_swapped = false;
+    img->depth_resolve = false;
     img->resolve_pitch = img->resolve_height = 0;
     img->content_serial = serial_;
     img->mem_bytes = src.bytes;
@@ -2049,7 +2229,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     return s;
   }
 
-  bool UploadTexture(Frame& f, HostImage& img, const TextureInfo& info, const TexSource& s, xenos::Endian endian) {
+  bool UploadTexture(Frame& f, HostImage& img, const TextureInfo& info, const TexSource& s, xenos::Endian endian,
+                     uint32_t layer = 0, uint32_t mip = 0) {
     const FormatInfo* fi = info.format_info();
     const uint32_t width = s.width, height = s.height;
     if (!width || !height || width > img.width || height > img.height) {
@@ -2083,7 +2264,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     DkCopyBuf cb{f.staging.gpu + off, 0, 0};
     DkImageView view;
     dkImageViewDefaults(&view, &img.image);
-    DkImageRect rect{0, 0, 0, width, height, 1};
+    view.mipLevelOffset = uint8_t(mip);
+    DkImageRect rect{0, 0, layer, width, height, 1};
     // A re-upload (the game reuses sprite memory between draws) or a recycled image: earlier draws of this frame
     // may still be sampling it.
     dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, 0);
@@ -2316,6 +2498,90 @@ class Deko3dCommandProcessor : public CommandProcessor {
     return true;
   }
 
+  // A depth resolve. The lighting shaders sample the scene depth as a k_24_8_FLOAT texture (fetch 15; Eden 0.73:
+  // every lighting draw was skipped for that texture). The host depth value is the guest's (the viewport keeps the
+  // guest depth range), so the texture is an R32F image holding it in red. The copy engine cannot turn depth into
+  // colour: a fullscreen draw (present.vert + depthcopy.frag) does. Every draw binds its whole state again, so
+  // nothing is restored here.
+  void ResolveDepth(Frame& f, const draw_util::ResolveInfo& info) {
+    DkCmdBuf cmd = f.cmdbuf;
+    const uint32_t src_pitch = info.depth_edram_info.pitch_tiles * 80;
+    uint32_t x = info.coordinate_info.edram_offset_x_div_8 * 8, y = info.coordinate_info.edram_offset_y_div_8 * 8;
+    uint32_t w = info.coordinate_info.width_div_8 * 8, h = info.height_div_8 * 8;
+    const uint32_t dest_pitch = info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32;
+    const uint32_t dest_height = info.copy_dest_coordinate_info.height_aligned_div_32 * 32;
+    const uint32_t dx = info.copy_dest_coordinate_info.offset_x_div_8 * 8, dy = info.copy_dest_coordinate_info.offset_y_div_8 * 8;
+    {
+      char key[96];
+      std::snprintf(key, sizeof(key), "depthresolve %u %u %u %u %u %u %08X %u %u", info.depth_edram_info.base_tiles, src_pitch, x, y, w, h,
+                    info.copy_dest_base, dx, dy);
+      LogOnce(key, "depth resolve EDRAM %u format %u pitch %u rect %u,%u %ux%u -> %08X at %u,%u (dest format %u endian %u pitch %u rows %u)%s",
+              info.depth_edram_info.base_tiles, uint32_t(info.depth_edram_info.format), src_pitch, x, y, w, h, info.copy_dest_base, dx, dy,
+              uint32_t(info.copy_dest_info.copy_dest_format), uint32_t(info.copy_dest_info.copy_dest_endian), dest_pitch, dest_height,
+              depth_fs_ && present_vs_ ? "" : " ignored: no depthcopy shader");
+    }
+    if (!depth_fs_ || !present_vs_) return;
+    HostImage* src = TargetImage(info.depth_edram_info.base_tiles, src_pitch, DkImageFormat_Z24S8, true);
+    if (!src) return;
+    HostImage* dst = GuestImage(f, info.copy_dest_base, dx + w, dy + h, DkImageFormat_R32_Float, true);
+    if (!dst) return;
+    dst->from_resolve = true;
+    dst->rb_swapped = false;
+    dst->depth_resolve = true;
+    dst->content_serial = serial_;
+    dst->resolve_pitch = dst->resolve_height = dst->composed_child_serial = 0;
+    dst->mem_bytes = dest_pitch * dest_height * 4;
+    dst->mem_hash = HashMemory(info.copy_dest_base, dst->mem_bytes);
+    if (x + w > src->width) w = x < src->width ? src->width - x : 0;
+    if (y + h > src->height) h = y < src->height ? src->height - y : 0;
+    if (dx + w > dst->width) w = dx < dst->width ? dst->width - dx : 0;
+    if (dy + h > dst->height) h = dy < dst->height ? dst->height - dy : 0;
+    const uint32_t slot = w && h ? DescriptorFor(f, src, 0) : UINT32_MAX;
+    if (slot == UINT32_MAX) return;
+    dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
+    BindTargets(cmd, dst, nullptr);
+    // The triangle's uv spans the viewport: the whole source image, placed so that source x,y lands on dx,dy.
+    DkViewport vp{float(dx) - float(x), float(dy) - float(y), float(src->width), float(src->height), 0.0f, 1.0f};
+    dkCmdBufSetViewports(cmd, 0, &vp, 1);
+    DkScissor sc{dx, dy, w, h};
+    dkCmdBufSetScissors(cmd, 0, &sc, 1);
+    DkRasterizerState rs;
+    dkRasterizerStateDefaults(&rs);
+    rs.cullMode = DkFace_None;
+    dkCmdBufBindRasterizerState(cmd, &rs);
+    DkColorState cs;
+    dkColorStateDefaults(&cs);
+    dkCmdBufBindColorState(cmd, &cs);
+    DkColorWriteState cw;
+    dkColorWriteStateDefaults(&cw);
+    dkCmdBufBindColorWriteState(cmd, &cw);
+    DkDepthStencilState ds;
+    dkDepthStencilStateDefaults(&ds);
+    ds.depthTestEnable = 0;
+    ds.depthWriteEnable = 0;
+    dkCmdBufBindDepthStencilState(cmd, &ds);
+    DkShader const* shaders[2] = {&present_vs_shader_, &depth_fs_shader_};
+    dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, shaders, 2);
+    dkCmdBufBindVtxAttribState(cmd, nullptr, 0);
+    dkCmdBufBindVtxBufferState(cmd, nullptr, 0);
+    const uint32_t clamp = (uint32_t(xenos::ClampMode::kClampToEdge) << 3) | (uint32_t(xenos::ClampMode::kClampToEdge) << 6);
+    DkResHandle handle = dkMakeTextureHandle(slot, clamp);  // nearest
+    dkCmdBufBindTextures(cmd, DkStage_Fragment, 0, &handle, 1);
+    dkCmdBufDraw(cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
+    Checkpoint(f, "depth resolve EDRAM %u %ux%u rect %u,%u %ux%u -> %08X %ux%u at %u,%u", info.depth_edram_info.base_tiles, src->width,
+               src->height, x, y, w, h, info.copy_dest_base, dst->width, dst->height, dx, dy);
+    dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
+    if (!dx && !dy && w == dest_pitch && !(w & 31)) {
+      dst->resolve_pitch = dest_pitch;
+      dst->resolve_height = h;
+      dst->resolve_frame = swaps_;
+      dst->resolve_format = uint32_t(info.copy_dest_info.copy_dest_format);
+      dst->resolve_endian = uint32_t(info.copy_dest_info.copy_dest_endian);
+    }
+    resolves_++;
+    frame_resolves_++;
+  }
+
   bool Resolve() {
     const RegisterFile& regs = *register_file_;
     Frame& f = frames_[frame_];
@@ -2323,10 +2589,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     draw_util::ResolveInfo info;
     if (!draw_util::GetResolveInfo(regs, *memory_, 1, 1, false, false, info)) { LogOnce("resolve", "GetResolveInfo failed"); return true; }
     if (info.IsCopyingDepth()) {
-      char key[48];
-      std::snprintf(key, sizeof(key), "depthresolve %08X", info.copy_dest_base);
-      LogOnce(key, "depth resolve EDRAM %u format %u to %08X ignored",
-              info.depth_edram_info.base_tiles, uint32_t(info.depth_edram_info.format), info.copy_dest_base);
+      ResolveDepth(f, info);
       return true;
     }
     if (info.color_edram_info.format_is_64bpp) {
@@ -2367,6 +2630,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
                                 packed ? DkImageFormat_RGB10A2_Unorm : DkImageFormat_RGBA8_Unorm, true);
     if (!dst) return true;
     dst->from_resolve = true;
+    dst->depth_resolve = false;
     // RB_COPY_DEST_INFO swap exchanges R and B in the written texels. The image keeps the target's channels, so the
     // consumer's fetch swizzle is applied as-is at the bind (the usual resolve identity convention stands for 60A).
     dst->rb_swapped = info.copy_dest_info.copy_dest_swap != 0;
@@ -2508,6 +2772,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
   DkImage const* swap_image_ptrs_[kFrames] = {};
   DkShader present_vs_shader_{}, present_fs_shader_{};
   bool present_vs_ = false, present_fs_ = false;
+  DkShader depth_fs_shader_{};  // depthcopy.frag (ResolveDepth)
+  bool depth_fs_ = false;
   bool present_target_ = false;
 #ifndef TMNT_DK_GL
   // Port menu RECORD 5 SEC (nx_menu.cpp, switch/host/frame_recorder.cpp, from hcu-switch): the 1920x1080 guest front buffer of each
