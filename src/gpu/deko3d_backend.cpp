@@ -553,6 +553,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     present_fs_ = LoadDksh(shader_dir_ + "present.frag.dksh", present_fs_shader_);
     depth_fs_ = LoadDksh(shader_dir_ + "depthcopy.frag.dksh", depth_fs_shader_);
     if (!depth_fs_) Log("no depthcopy.frag.dksh: depth resolves are ignored");
+    restore_fs_ = LoadDksh(shader_dir_ + "depthrestore.frag.dksh", restore_fs_shader_);
+    if (!restore_fs_) Log("no depthrestore.frag.dksh: depth restore draws are skipped");
     Log("deko3d backend up: shaders from %s (%s present shaders), %u MB images, %u MB data per frame",
         shader_dir_.c_str(), present_vs_ && present_fs_ ? "with" : "WITHOUT", kImagePoolBytes >> 20, kFrameDataBytes >> 20);
     BeginFrame();
@@ -689,6 +691,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     uint32_t tcount = 0;
     uint64_t texset_key = pair_key;
     bool textures_ok = true;
+    bool depth_alias = false;  // a depth resolve image fetched as a colour texture: the XDK depth restore
     uint32_t tb_index = 0;
     for (const auto& tb : ps->texture_bindings()) {
       auto fetch = regs.GetTextureFetch(tb.fetch_constant);
@@ -715,6 +718,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
           if (MemoryChanged(*tex, c.base, c.split_candidate ? tex->mem_bytes : c.bytes)) valid = false; else tex->checked_serial = serial_;
         }
         if (valid) {
+          if (tex->depth_resolve && !IsDepthTexture(fetch.format)) depth_alias = true;
           if (c.split_candidate) ComposeAdjacentResolve(f, *tex);
           dkCmdBufBindTextures(cmd, DkStage_Fragment, tb.fetch_constant, &c.handle, 1);
           texset_key = (texset_key ^ c.base) * 0x100000001B3ull + tb.fetch_constant;
@@ -734,6 +738,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       }
       HostImage* tex = TextureImage(f, info, fetch);
       if (!tex) { textures_ok = false; continue; }  // e.g. the staging ring is full this frame: draw next frame
+      if (tex->depth_resolve && !IsDepthTexture(fetch.format)) depth_alias = true;
       // A depth resolve image holds host values (never guest bytes): the fetch's tiling, format and byte order
       // say nothing about it, so the two slices of the scene depth compose whatever the fetch declares.
       const bool split_candidate = tex->from_resolve && tex->width > 32 && tex->height > 32 &&
@@ -794,6 +799,20 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     // A draw with a missing texture would sample whatever the slot held before (noise): skip it.
     if (!textures_ok) { skipped_++; return true; }
+    // The XDK depth restore (Eden 0.75: "rt0 base 0 format 0" = the depth buffer's EDRAM base, tf0 = the saved depth
+    // 1F360000 fetched as k_8_8_8_8, between the two tiles and before the lighting passes): the guest writes the
+    // saved depth's raw bytes through a colour alias of the depth buffer. The host writes the R32F copy's values
+    // into the depth target at that base (depthrestore.frag in place of the guest pixel shader). Another shader
+    // sampling a depth image as colour would draw noise: skipped.
+    const bool depth_restore = depth_alias;
+    if (depth_restore && (!restore_fs_ || ps->ucode_data_hash() != 0x894498C723463852ull || mode == xenos::EdramMode::kDepthOnly)) {
+      char key[48];
+      std::snprintf(key, sizeof(key), "depthalias %016llX", (unsigned long long)ps->ucode_data_hash());
+      LogOnce(key, "draw PS %016llX samples a depth resolve image as colour: skipped (no depth restore for it)",
+              (unsigned long long)ps->ucode_data_hash());
+      skipped_++;
+      return true;
+    }
     phase(2);
 
     // Render targets.
@@ -802,7 +821,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     uint32_t pitch = EffectivePitch(surf);
     HostImage* colors[4] = {};
     HostImage* color = nullptr;
-    if (mode != xenos::EdramMode::kDepthOnly) {
+    if (mode != xenos::EdramMode::kDepthOnly && !depth_restore) {
       for (uint32_t i = 0; i < 4; i++) {
         if (!((color_mask >> (i * 4)) & 0xF)) continue;
         auto ci = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
@@ -812,6 +831,14 @@ class Deko3dCommandProcessor : public CommandProcessor {
       }
     }
     HostImage* depth = (dc.z_enable || dc.stencil_enable) ? TargetImage(depth_info.depth_base, pitch, DkImageFormat_Z24S8, true) : nullptr;
+    if (depth_restore) {
+      auto ci = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+      depth = TargetImage(ci.color_base, pitch, DkImageFormat_Z24S8, true);
+      char key[64];
+      std::snprintf(key, sizeof(key), "depthrestore %u %u", uint32_t(ci.color_base), pitch);
+      LogOnce(key, "depth restore: the depth image drawn into the depth target at EDRAM %u pitch %u (guest depth base %u)",
+              uint32_t(ci.color_base), pitch, uint32_t(depth_info.depth_base));
+    }
     if (!color && !depth) { skipped_++; return true; }
     if (!BindTargetSet(cmd, colors, depth)) { skipped_++; return true; }
     uint32_t target_w = color ? color->width : depth->width;
@@ -876,12 +903,17 @@ class Deko3dCommandProcessor : public CommandProcessor {
     ds.depthTestEnable = depth && dc.z_enable;
     ds.depthWriteEnable = depth && dc.z_write_enable;
     ds.depthCompareOp = CompareOp(dc.zfunc);
+    if (depth_restore) {
+      ds.depthTestEnable = 1;  // depth writes need the test on
+      ds.depthWriteEnable = 1;
+      ds.depthCompareOp = DkCompareOp_Always;
+    }
     ds.stencilTestEnable = 0;
     dkCmdBufBindDepthStencilState(cmd, &ds);
 
     if (!skip_pairs_.empty() && skip_pairs_.count(PairKey({vs->ucode_data_hash(), ps->ucode_data_hash()}))) { skipped_++; return true; }
     // Shaders (the whole graphics mask: a stage without a shader here is unbound).
-    DkShader const* shaders[3] = {&vs->shader, &ps->shader, &vs->geom};
+    DkShader const* shaders[3] = {&vs->shader, depth_restore ? &restore_fs_shader_ : &ps->shader, &vs->geom};
     dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, shaders, use_gs ? 3 : 2);
     phase(3);
 
@@ -1828,7 +1860,46 @@ class Deko3dCommandProcessor : public CommandProcessor {
     BindTargetSet(cmd, colors, depth);
   }
 
+  // The slices of a depth texture resolved one by one (the scene depth: 384 + 336 rows at 1F360000 / 1F540000; the
+  // shadow atlas 512x3072 at 1BD18000: 512-row slices at 1BD18000 + n * 0x100000). Each slice after the first is
+  // its own depth resolve image; its rows are copied into the parent when any of them is newer than the last copy.
+  void ComposeDepthSlices(Frame& f, HostImage& parent) {
+    if (!parent.resolve_height || parent.resolve_pitch != parent.width || parent.resolve_height >= parent.height) return;
+    struct Part { HostImage* img; uint32_t row, rows; } parts[16];
+    uint32_t count = 0, newest = 0;
+    for (uint32_t row = parent.resolve_height; row < parent.height && count < 16;) {
+      uint64_t child_base = uint64_t(parent.guest_base) + uint64_t(parent.resolve_pitch) * row * 4;
+      if (child_base > UINT32_MAX) break;
+      auto it = guest_images_.find(uint32_t(child_base));
+      if (it == guest_images_.end()) break;
+      HostImage& child = *it->second;
+      if (!child.depth_resolve || child.width != parent.width || !child.resolve_height ||
+          child.resolve_pitch != parent.resolve_pitch || child.height < child.resolve_height) break;
+      const uint32_t rows = std::min(child.resolve_height, parent.height - row);
+      parts[count++] = Part{&child, row, rows};
+      newest = std::max(newest, child.content_serial);
+      row += rows;
+    }
+    if (!count || newest == parent.composed_child_serial) return;
+    dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
+    for (uint32_t i = 0; i < count; i++) {
+      DkImageView sv, dv;
+      dkImageViewDefaults(&sv, &parts[i].img->image);
+      dkImageViewDefaults(&dv, &parent.image);
+      DkImageRect sr{0, 0, 0, parent.width, parts[i].rows, 1};
+      DkImageRect dr{0, parts[i].row, 0, parent.width, parts[i].rows, 1};
+      dkCmdBufCopyImage(f.cmdbuf, &sv, &sr, &dv, &dr, 0);
+    }
+    dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
+    parent.composed_child_serial = newest;
+    char key[48];
+    std::snprintf(key, sizeof(key), "depthparts %08X %u", parent.guest_base, count);
+    LogOnce(key, "composed depth slices at %08X: %ux%u + %u slices (the first %u rows at %08X)", parent.guest_base, parent.width,
+            parent.resolve_height, count, parts[0].rows, parts[0].img->guest_base);
+  }
+
   void ComposeAdjacentResolve(Frame& f, HostImage& parent) {
+    if (parent.depth_resolve) { ComposeDepthSlices(f, parent); return; }
     if (!parent.from_resolve || parent.resolve_frame != swaps_ || parent.resolve_pitch != parent.width ||
         !parent.resolve_height || parent.resolve_height >= parent.height || (parent.resolve_height & 31) ||
         MemoryChanged(parent, parent.guest_base, parent.mem_bytes)) return;
@@ -1940,6 +2011,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
     guest_images_.emplace(base, img);
     if (create_w || create_h) ClearNewImage(img);
     return img;
+  }
+
+  static bool IsDepthTexture(xenos::TextureFormat format) {
+    return format == xenos::TextureFormat::k_24_8 || format == xenos::TextureFormat::k_24_8_FLOAT;
   }
 
   static bool ResolveFetchFormatMatches(uint32_t resolved, xenos::TextureFormat fetched) {
@@ -2088,9 +2163,15 @@ class Deko3dCommandProcessor : public CommandProcessor {
   HostImage* TextureImage(Frame& f, const TextureInfo& info, const xenos::xe_gpu_texture_fetch_t& fetch) {
     DkImageFormat format;
     bool reversed;
-    if (info.format == xenos::TextureFormat::k_24_8 || info.format == xenos::TextureFormat::k_24_8_FLOAT) {
+    auto depth_it = guest_images_.find(info.memory.base_address);
+    // The saved depth fetched as a 4-byte colour texture (the XDK depth restore reads its raw bytes): the depth
+    // resolve image itself, unless the guest wrote that memory since (then it is a texture again).
+    const bool depth_alias = !IsDepthTexture(info.format) && depth_it != guest_images_.end() && depth_it->second->depth_resolve &&
+                             info.format_info()->bytes_per_block() == 4 &&
+                             !MemoryChanged(*depth_it->second, info.memory.base_address, depth_it->second->mem_bytes);
+    if (IsDepthTexture(info.format) || depth_alias) {
       // The scene depth: only as the R32F copy a depth resolve made (guest memory holds no depth: nothing to upload).
-      auto it = guest_images_.find(info.memory.base_address);
+      auto it = depth_it;
       char key[40];
       std::snprintf(key, sizeof(key), "depthtex %08X", info.memory.base_address);
       if (it == guest_images_.end() || !it->second->depth_resolve) {
@@ -2782,6 +2863,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
   bool present_vs_ = false, present_fs_ = false;
   DkShader depth_fs_shader_{};  // depthcopy.frag (ResolveDepth)
   bool depth_fs_ = false;
+  DkShader restore_fs_shader_{};  // depthrestore.frag (the XDK depth restore draw)
+  bool restore_fs_ = false;
   bool present_target_ = false;
 #ifndef TMNT_DK_GL
   // Port menu RECORD 5 SEC (nx_menu.cpp, switch/host/frame_recorder.cpp, from hcu-switch): the 1920x1080 guest front buffer of each
