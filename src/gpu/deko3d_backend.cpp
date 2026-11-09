@@ -142,9 +142,13 @@ void Log(const char* fmt, ...) {
 std::function<void(const char*)> g_dk_fault_dump;
 
 void DebugCallback(void*, const char* context, DkResult result, const char* message) {
+  // A failing command buffer repeats the error on every call (Eden 0.70: a 539 MB log): 32 messages, one dump.
+  static uint32_t count = 0;
+  static bool dumped = false;
+  if (count++ >= 32) return;
   Log("deko3d %s: result %d: %s", context ? context : "?", int(result), message ? message : "");
   std::fflush(stdout);  // deko3d aborts right after an error (console 0.56: the message was lost)
-  if (g_dk_fault_dump) g_dk_fault_dump(context ? context : "deko3d error");
+  if (g_dk_fault_dump && !dumped) { dumped = true; g_dk_fault_dump(context ? context : "deko3d error"); }
 }
 
 struct MemBlock {
