@@ -964,8 +964,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // vertex offset is -min_index. A copy from vertex 0 grows with the highest index, whatever the draw reads (Eden
     // 0.78, level 1: the vertex phase grew to 2-4 s a frame, the 24 MB frame ring filled, draws were dropped; the
     // index values themselves were not logged then: the "vertex copy" line below measures them).
-    // A storage-buffer shader computes its record addresses from gl_VertexID, which must stay the guest index: its
-    // streams still start at vertex 0. ponytail: (max index + 1) records per stream there; bound the instance
+    // A storage-buffer shader computes its record addresses from gl_VertexID + Sys alpha.w (the offset, BindUniforms),
+    // which must be the guest index: its streams still start at vertex 0 and it draws without a vertex offset. The
+    // game's instancing shaders take the instance from that index (index / c19.x). ponytail: (max index + 1) records per stream there; bound the instance
     // stream by the shader's own divisor (c19.x) if the frame ring still fills.
     const uint32_t first_vertex = vs->ssbo ? 0 : uint32_t(std::max<int64_t>(0, int64_t(min_index) + indx_offset));
     const uint32_t stream_vertices = vs->ssbo ? uint32_t(std::max<int64_t>(0, int64_t(vertex_count) + indx_offset))
@@ -1065,9 +1066,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (index_buffer_info) {
       dkCmdBufBindIdxBuffer(cmd, index_buffer_info->format == xenos::IndexFormat::kInt32 ? DkIdxFormat_Uint32 : DkIdxFormat_Uint16,
                             f.data.gpu + index_offset);
-      dkCmdBufDrawIndexed(cmd, prim, index_count, 1, 0, vs->ssbo ? indx_offset : -int32_t(min_index), 0);
+      dkCmdBufDrawIndexed(cmd, prim, index_count, 1, 0, vs->ssbo ? 0 : -int32_t(min_index), 0);
     } else {
-      dkCmdBufDraw(cmd, prim, index_count, 1, vs->ssbo ? uint32_t(std::max(indx_offset, 0)) : 0, 0);
+      dkCmdBufDraw(cmd, prim, index_count, 1, 0, 0);
     }
     Checkpoint(f, "draw VS %016llX PS %016llX n=%u target=%ux%u first_texture=%08X %ux%u",
                (unsigned long long)vs->ucode_data_hash(), (unsigned long long)ps->ucode_data_hash(), index_count,
@@ -2548,7 +2549,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     sys.alpha[0] = cc.alpha_test_enable ? 1.0f : 0.0f;
     sys.alpha[1] = float(uint32_t(cc.alpha_func));
     sys.alpha[2] = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
-    sys.alpha[3] = 0.0f;  // was the DBG TEX LOD switch (0.258-0.276); the fetches use the computed LOD now
+    // VGT_INDX_OFFSET for the storage-buffer vertex shaders (xenos2glsl: r0.x = gl_VertexID + alpha.w); signed 24 bits.
+    sys.alpha[3] = float(int32_t(regs.Get<reg::VGT_INDX_OFFSET>().indx_offset << 8) >> 8);
     std::memcpy(sys.bools, &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], sizeof(sys.bools));
     std::memcpy(sys.loops, &regs.values[XE_GPU_REG_SHADER_CONSTANT_LOOP_00], sizeof(sys.loops));
     if (f.sys_uni == UINT32_MAX || std::memcmp(&sys, &f.last_sys, sizeof(sys)) != 0) {

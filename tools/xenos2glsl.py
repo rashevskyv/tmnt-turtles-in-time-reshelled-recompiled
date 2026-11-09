@@ -12,7 +12,7 @@ Interface of the generated GLSL (the deko3d backend relies on it):
             layout(std430, binding = b) readonly buffer { uint w[]; } (b = the SDK's vertex binding index) and
             an empty shader_<hash>.vert.ssbo marker tells the backend to bind storage buffers;
             binding 0 = uniform Consts { vec4 c[256]; } (the ALU constants c0..c255);
-            binding 1 = uniform Sys (ndc_scale, ndc_offset, alpha test, bool constants);
+            binding 1 = uniform Sys (ndc_scale, ndc_offset, alpha test + VGT_INDX_OFFSET in alpha.w, bool constants);
             layout(location = k) out vec4 o_k      the interpolators the shader exports.
   fragment: layout(location = k) in vec4 i_k       the interpolators it reads (r_k at start);
             layout(binding = n) uniform sampler2D tf_n (1D/3D/Cube by the fetch's dimension);
@@ -670,7 +670,9 @@ class Translator:
             if self.stage == 'frag' and i in self.reads_before_write:
                 out.append(ind + 'vec4 r%d = i_%d;' % (i, i))
             elif self.stage == 'vert' and i == 0 and self.ssbo:
-                out.append(ind + 'vec4 r0 = vec4(float(gl_VertexID), 0.0, 0.0, 0.0);  // the vertex index')
+                # Sys alpha.w = VGT_INDX_OFFSET: the backend draws these shaders without a base vertex, so
+                # gl_VertexID is the index itself on every host (GL adds the base vertex to it, NVN may not).
+                out.append(ind + 'vec4 r0 = vec4(float(gl_VertexID) + alpha.w, 0.0, 0.0, 0.0);  // the vertex index')
             else:
                 out.append(ind + 'vec4 r%d = vec4(0.0);' % i)
         for e in sorted(self.exports):
