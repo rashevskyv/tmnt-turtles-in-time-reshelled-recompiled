@@ -2303,7 +2303,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
     draw_util::ResolveInfo info;
     if (!draw_util::GetResolveInfo(regs, *memory_, 1, 1, false, false, info)) { LogOnce("resolve", "GetResolveInfo failed"); return true; }
     if (info.IsCopyingDepth()) {
-      LogOnce("depthresolve", "depth resolve to %08X ignored", info.copy_dest_base);
+      char key[48];
+      std::snprintf(key, sizeof(key), "depthresolve %08X", info.copy_dest_base);
+      LogOnce(key, "depth resolve EDRAM %u format %u to %08X ignored",
+              info.depth_edram_info.base_tiles, uint32_t(info.depth_edram_info.format), info.copy_dest_base);
       return true;
     }
     if (info.color_edram_info.format_is_64bpp) {
