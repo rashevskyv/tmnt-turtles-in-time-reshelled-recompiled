@@ -432,6 +432,8 @@ DkImageSwizzle SwizzleOf(uint32_t s) {
 // RB_COPY_DEST_INFO swap writes red and blue exchanged, so the fetch swizzle with its red and blue sources
 // exchanged reads them back: 60A gives the identity (0), as the SDK's SwapRedBlueSwizzle does. Without the swap
 // (only the depth resolves in this game): the identity.
+// ponytail: a colour resolve without the swap also gets the identity, not its fetch swizzle; apply the fetch
+// swizzle unchanged there when a game resolves colour that way.
 uint32_t ResolveSwizzle(bool rb_swapped, uint32_t fetch_swizzle) {
   if (!rb_swapped) return 0;
   uint32_t r = 0;
@@ -940,28 +942,46 @@ class Deko3dCommandProcessor : public CommandProcessor {
     DkVtxBufferState buffers[DK_MAX_VERTEX_BUFFERS];
     uint32_t attrib_count = 0, buffer_count = 0, ssbo_count = 0;
     uint32_t vertex_count = index_count;
+    uint32_t min_index = 0;  // the lowest vertex index the draw reads
     uint32_t index_offset = UINT32_MAX;
     uint32_t restart_index = regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx;
     bool restart = index_buffer_info && su.multi_prim_ib_ena && SupportsPrimitiveReset(prim_type) &&
                    (index_buffer_info->format != xenos::IndexFormat::kInt16 || restart_index <= UINT16_MAX);
     if (index_buffer_info) {
       uint32_t restart_hits = 0;
-      if (!CopyIndices(f, *index_buffer_info, restart, restart_index, index_offset, vertex_count, restart_hits)) { skipped_++; return true; }
+      if (!CopyIndices(f, *index_buffer_info, restart, restart_index, index_offset, vertex_count, min_index, restart_hits)) { skipped_++; return true; }
       if (restart_hits) LogOnce("primrestart", "primitive restart VS %016llX PS %016llX prim %u index %06X: %u of %u indices",
                                 (unsigned long long)vs->ucode_data_hash(), (unsigned long long)ps->ucode_data_hash(),
                                 uint32_t(prim_type), restart_index, restart_hits, index_buffer_info->count);
       if (!vertex_count) { skipped_++; return true; }
     }
+    // VGT_INDX_OFFSET (Direct3D BaseVertexIndex): the guest fetches vertex (index + offset), in 24 bits.
+    // ponytail: VGT_MIN_VTX_INDX / VGT_MAX_VTX_INDX (the SDK clamps the sum to them) are not read.
+    const int32_t indx_offset = int32_t(regs.Get<reg::VGT_INDX_OFFSET>().indx_offset << 8) >> 8;
+    if (indx_offset) LogOnce("indxoffset", "VGT_INDX_OFFSET %d: VS %016llX n=%u indices %u-%u", indx_offset,
+                             (unsigned long long)vs->ucode_data_hash(), index_count, min_index, vertex_count - 1);
+    // An attribute stream holds only the vertices the draw reads, [first_vertex, first_vertex + count): the draw's
+    // vertex offset is -min_index. A copy from vertex 0 grows with the highest index, whatever the draw reads (Eden
+    // 0.78, level 1: the vertex phase grew to 2-4 s a frame, the 24 MB frame ring filled, draws were dropped; the
+    // index values themselves were not logged then: the "vertex copy" line below measures them).
+    // A storage-buffer shader computes its record addresses from gl_VertexID, which must stay the guest index: its
+    // streams still start at vertex 0. ponytail: (max index + 1) records per stream there; bound the instance
+    // stream by the shader's own divisor (c19.x) if the frame ring still fills.
+    const uint32_t first_vertex = vs->ssbo ? 0 : uint32_t(std::max<int64_t>(0, int64_t(min_index) + indx_offset));
+    const uint32_t stream_vertices = vs->ssbo ? uint32_t(std::max<int64_t>(0, int64_t(vertex_count) + indx_offset))
+                                              : vertex_count - min_index;
+    uint32_t copied_bytes = 0;
     for (const auto& vb : vs->vertex_bindings()) {
       if (buffer_count >= DK_MAX_VERTEX_BUFFERS) break;
       auto fetch = regs.GetVertexFetch(vb.fetch_constant);
       uint32_t stride = vb.stride_words * 4;
-      if (stride && vertex_count > UINT32_MAX / stride) {
-        LogOnce("vbsize", "vertex data size overflow: %u vertices x %u bytes", vertex_count, stride);
+      if (stride && stream_vertices > UINT32_MAX / stride) {
+        LogOnce("vbsize", "vertex data size overflow: %u vertices x %u bytes", stream_vertices, stride);
         skipped_++; return true;
       }
-      uint32_t bytes = vertex_count * stride;
-      uint32_t avail = fetch.size * 4;
+      uint32_t bytes = stream_vertices * stride;
+      const uint32_t skip = uint32_t(std::min<uint64_t>(uint64_t(first_vertex) * stride, uint64_t(fetch.size) * 4));
+      uint32_t avail = fetch.size * 4 - skip;
       if (!stride) {
         // A constant stream still needs one record, regardless of the vertex index.
         uint32_t extent_words = 0;
@@ -990,14 +1010,15 @@ class Deko3dCommandProcessor : public CommandProcessor {
         bytes = extent_words * 4;
       }
       if (bytes > avail) {
-        LogOnce("vbclamp", "vertex data clamped: %u vertices x %u bytes = %u, fetch constant %u holds %u bytes (VS %016llX)", vertex_count,
-                stride, bytes, vb.fetch_constant, avail, (unsigned long long)vs->ucode_data_hash());
+        LogOnce("vbclamp", "vertex data clamped: %u vertices from %u x %u bytes = %u, fetch constant %u holds %u bytes (VS %016llX)", stream_vertices,
+                first_vertex, stride, bytes, vb.fetch_constant, avail, (unsigned long long)vs->ucode_data_hash());
         bytes = avail;
       }
       uint32_t off = f.data.Alloc(bytes ? bytes : 16, 256);
-      if (off == UINT32_MAX) { LogOnce("ring", "frame data ring full"); skipped_++; return true; }
-      const uint8_t* src = memory_->TranslatePhysical(fetch.address << 2);
+      if (off == UINT32_MAX) { RingFull(f, "vertices", bytes, vs->ucode_data_hash()); skipped_++; return true; }
+      const uint8_t* src = memory_->TranslatePhysical(fetch.address << 2) + skip;
       texture_conversion::CopySwapBlock(fetch.endian, f.data.cpu + off, src, bytes);
+      copied_bytes += bytes;
       if (vs->ssbo) {
         // The shader computes its record addresses (floor(index) * stride + offset) and bounds-checks them against
         // this size; every index it derives from the vertex id is at most the vertex id, so the per-vertex extent
@@ -1027,6 +1048,11 @@ class Deko3dCommandProcessor : public CommandProcessor {
       }
       buffer_count++;
     }
+    if (copied_bytes > (1u << 20) && big_copy_logs_ < 12) {
+      big_copy_logs_++;
+      Log("vertex copy %u KB: VS %016llX n=%u indices %u-%u offset %d%s", copied_bytes >> 10, (unsigned long long)vs->ucode_data_hash(),
+          index_count, min_index, vertex_count - 1, indx_offset, vs->ssbo ? " (storage buffers)" : "");
+    }
     dkCmdBufBindVtxAttribState(cmd, attribs, attrib_count);
     dkCmdBufBindVtxBufferState(cmd, buffers, buffer_count);
     phase(4);
@@ -1039,9 +1065,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (index_buffer_info) {
       dkCmdBufBindIdxBuffer(cmd, index_buffer_info->format == xenos::IndexFormat::kInt32 ? DkIdxFormat_Uint32 : DkIdxFormat_Uint16,
                             f.data.gpu + index_offset);
-      dkCmdBufDrawIndexed(cmd, prim, index_count, 1, 0, 0, 0);
+      dkCmdBufDrawIndexed(cmd, prim, index_count, 1, 0, vs->ssbo ? indx_offset : -int32_t(min_index), 0);
     } else {
-      dkCmdBufDraw(cmd, prim, index_count, 1, 0, 0);
+      dkCmdBufDraw(cmd, prim, index_count, 1, vs->ssbo ? uint32_t(std::max(indx_offset, 0)) : 0, 0);
     }
     Checkpoint(f, "draw VS %016llX PS %016llX n=%u target=%ux%u first_texture=%08X %ux%u",
                (unsigned long long)vs->ucode_data_hash(), (unsigned long long)ps->ucode_data_hash(), index_count,
@@ -1093,13 +1119,13 @@ class Deko3dCommandProcessor : public CommandProcessor {
       }
       char line[1400];
       std::snprintf(line, sizeof(line),
-                    "#%u prim %u n=%u VS %08X PS %08X target %s%ux%u vp %g,%g %gx%g sc %d,%d %ux%u blend %u/%u/%u cull f%u b%u z %u/%u rects %d |%s | v:%s",
+                    "#%u prim %u n=%u VS %08X PS %08X target %s%ux%u vp %g,%g %gx%g sc %d,%d %ux%u blend %u/%u/%u cull f%u b%u z %u/%u rects %d off %d idx %u-%u copy %u |%s | v:%s",
                     frame_draws_, uint32_t(prim_type), index_count, uint32_t(vs->ucode_data_hash()), uint32_t(ps->ucode_data_hash()),
                     color ? "" : "none ", color ? color->width : 0, color ? color->height : 0, vp.x, vp.y, vp.width, vp.height,
                     scissor.x, scissor.y, scissor.width, scissor.height,
                     uint32_t(regs.Get<reg::RB_BLENDCONTROL>().color_srcblend), uint32_t(regs.Get<reg::RB_BLENDCONTROL>().color_destblend),
                     uint32_t(regs.Get<reg::RB_BLENDCONTROL>().color_comb_fcn), su.cull_front, su.cull_back, dc.z_enable, dc.z_write_enable,
-                    rects ? 1 : 0, bound_textures.c_str(), verts.c_str());
+                    rects ? 1 : 0, indx_offset, min_index, vertex_count - 1, copied_bytes, bound_textures.c_str(), verts.c_str());
       trace_lines_.emplace_back(line);
     }
     if (ps->ucode_data_hash() == 0xB3EC630B32280C8Cull) frame_sprite_draws_++;
@@ -1386,6 +1412,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
           frame_clears_, frame_resolves_, frame_skipped_, frame_missing_, frame_reuploads_, (unsigned long long)(dirty_pages_ - dirty_pages_at_swap_),
           f.data.used >> 10, f.staging.used >> 10, image_count_, images_.used >> 20);
     }
+    if (frame_ring_full_ && ring_full_logs_ < 40) {
+      ring_full_logs_++;
+      Log("frame data ring full: swap #%u dropped %u draws, drew %u (first: %s); data %u KB", swaps_, frame_ring_full_,
+          frame_draws_, ring_first_, f.data.used >> 10);
+    }
+    frame_ring_full_ = 0;
     dirty_pages_at_swap_ = dirty_pages_;
     frame_draws_ = frame_clears_ = frame_resolves_ = frame_skipped_ = frame_missing_ = frame_reuploads_ = 0;
     frame_sprite_draws_ = 0;
@@ -2420,7 +2452,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
 
   // ----- draws ----------------------------------------------------------------------------------
   bool CopyIndices(Frame& f, const IndexBufferInfo& ib, bool restart, uint32_t restart_index,
-                   uint32_t& offset_out, uint32_t& vertex_count_out, uint32_t& restart_hits) {
+                   uint32_t& offset_out, uint32_t& vertex_count_out, uint32_t& min_index_out, uint32_t& restart_hits) {
     const uint32_t index_size = ib.format == xenos::IndexFormat::kInt32 ? 4 : 2;
     if (ib.length > UINT32_MAX || uint64_t(ib.count) * index_size > ib.length) {
       LogOnce("indexrange", "invalid index buffer: %u indices, %zu bytes", ib.count, ib.length);
@@ -2428,9 +2460,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     uint32_t bytes = uint32_t(ib.length);
     uint32_t off = f.data.Alloc(bytes, 64);
-    if (off == UINT32_MAX) { LogOnce("ring", "frame data ring full (indices)"); return false; }
+    if (off == UINT32_MAX) return RingFull(f, "indices", bytes, 0);
     const uint8_t* src = memory_->TranslatePhysical(ib.guest_base);
-    uint32_t max_index = 0;
+    uint32_t max_index = 0, min_index = UINT32_MAX;
     bool has_vertex = false;
     if (ib.format == xenos::IndexFormat::kInt32) {
       const uint32_t* s = reinterpret_cast<const uint32_t*>(src);
@@ -2442,6 +2474,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
         if (restart && v == restart_index) { restart_hits++; continue; }
         has_vertex = true;
         if (v > max_index) max_index = v;
+        if (v < min_index) min_index = v;
       }
     } else {
       const uint16_t* s = reinterpret_cast<const uint16_t*>(src);
@@ -2454,11 +2487,13 @@ class Deko3dCommandProcessor : public CommandProcessor {
         if (restart && v == restart_index) { restart_hits++; continue; }
         has_vertex = true;
         if (v > max_index) max_index = v;
+        if (v < min_index) min_index = v;
       }
     }
     offset_out = off;
     if (has_vertex && max_index == UINT32_MAX) { LogOnce("indexmax", "vertex index is too large"); return false; }
     vertex_count_out = has_vertex ? max_index + 1 : 0;
+    min_index_out = has_vertex ? min_index : 0;
     return true;
   }
 
@@ -2486,7 +2521,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     bool bind_vs = false, bind_ps = false;
     if (vs_consts_dirty_ || f.vs_uni == UINT32_MAX || f.vs_uni_shader != vs) {
       const uint32_t off = f.data.Alloc(4096, DK_UNIFORM_BUF_ALIGNMENT);
-      if (off == UINT32_MAX) { LogOnce("ring", "frame data ring full (uniforms)"); return false; }
+      if (off == UINT32_MAX) return RingFull(f, "uniforms", 4096, vs->ucode_data_hash());
       CopyConstantSpan(f.data.cpu + off, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], vs);
       f.vs_uni = off;
       f.vs_uni_shader = vs;
@@ -2496,7 +2531,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     if (ps_consts_dirty_ || f.ps_uni == UINT32_MAX || f.ps_uni_shader != ps) {
       const uint32_t off = f.data.Alloc(4096, DK_UNIFORM_BUF_ALIGNMENT);
-      if (off == UINT32_MAX) { LogOnce("ring", "frame data ring full (uniforms)"); return false; }
+      if (off == UINT32_MAX) return RingFull(f, "uniforms", 4096, vs->ucode_data_hash());
       CopyConstantSpan(f.data.cpu + off, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X], ps);
       f.ps_uni = off;
       f.ps_uni_shader = ps;
@@ -2518,7 +2553,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     std::memcpy(sys.loops, &regs.values[XE_GPU_REG_SHADER_CONSTANT_LOOP_00], sizeof(sys.loops));
     if (f.sys_uni == UINT32_MAX || std::memcmp(&sys, &f.last_sys, sizeof(sys)) != 0) {
       const uint32_t off = f.data.Alloc(sizeof(SysConstants), DK_UNIFORM_BUF_ALIGNMENT);
-      if (off == UINT32_MAX) { LogOnce("ring", "frame data ring full (uniforms)"); return false; }
+      if (off == UINT32_MAX) return RingFull(f, "uniforms", 4096, vs->ucode_data_hash());
       std::memcpy(f.data.cpu + off, &sys, sizeof(sys));
       f.sys_uni = off;
       f.last_sys = sys;
@@ -2864,6 +2899,14 @@ class Deko3dCommandProcessor : public CommandProcessor {
 #endif
   }
 
+  // A draw that does not fit the frame data ring is dropped: counted per frame, the first one described (the swap logs it).
+  bool RingFull(const Frame& f, const char* what, uint32_t bytes, uint64_t vs_hash) {
+    if (!frame_ring_full_++) {
+      std::snprintf(ring_first_, sizeof(ring_first_), "draw #%u VS %016llX: %u bytes of %s at %u KB used", frame_draws_,
+                    (unsigned long long)vs_hash, bytes, what, f.data.used >> 10);
+    }
+    return false;
+  }
   // First sighting of a numeric key (the per-draw diagnostics: no string building on the command thread).
   bool FirstTime(uint64_t key) { return seen_.insert(key).second; }
   void LogOnce(const char* key, const char* fmt, ...) {
@@ -2962,6 +3005,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
   uint32_t trace_min_swap_ = 0;  // seconds after the backend started
   double trace_start_ms_ = 0;
   uint32_t trace_second_ = 0;
+  uint32_t frame_ring_full_ = 0, ring_full_logs_ = 0;  // draws dropped for a full frame data ring: this frame, frames logged
+  char ring_first_[160] = "";
+  uint32_t big_copy_logs_ = 0;
   uint32_t ring_full_swap_ = 0;  // swap of the first staging-ring-full event (the first stage frame)
   uint32_t trace_after_full_ = 60;
   uint32_t frame_sprite_draws_ = 0;  // draws of the paletted sprite pixel shader in this frame
