@@ -260,7 +260,8 @@ struct Frame {
   std::vector<std::pair<uint64_t, uint64_t>> draw_log;  // VS, PS of each draw: printed when the frame hangs the GPU
 };
 
-DkCompareOp CompareOp(xenos::CompareFunction f) { return DkCompareOp(uint32_t(f)); }
+// Xenos CompareFunction is 0..7 (never .. always), DkCompareOp is 1..8 in the same order.
+DkCompareOp CompareOp(xenos::CompareFunction f) { return DkCompareOp(uint32_t(f) + 1); }
 
 DkBlendFactor BlendFactor(xenos::BlendFactor f) {
   switch (f) {
@@ -838,6 +839,11 @@ class Deko3dCommandProcessor : public CommandProcessor {
       std::snprintf(key, sizeof(key), "depthrestore %u %u", uint32_t(ci.color_base), pitch);
       LogOnce(key, "depth restore: the depth image drawn into the depth target at EDRAM %u pitch %u (guest depth base %u)",
               uint32_t(ci.color_base), pitch, uint32_t(depth_info.depth_base));
+      // The constants of the guest shaders, once per texel offset: position c240, address c241, the half swap c255.
+      auto cf = [&](uint32_t reg, uint32_t k) { return regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + reg * 4 + k); };
+      std::snprintf(key, sizeof(key), "depthrestore consts %g %g", cf(241, 2), cf(241, 3));
+      LogOnce(key, "depth restore constants: vs c240 %g %g %g %g, c241 %g %g %g %g, c255 %g %g; ps c255 %g %g %g", cf(240, 0), cf(240, 1),
+              cf(240, 2), cf(240, 3), cf(241, 0), cf(241, 1), cf(241, 2), cf(241, 3), cf(255, 0), cf(255, 1), cf(511, 0), cf(511, 1), cf(511, 2));
     }
     if (!color && !depth) { skipped_++; return true; }
     if (!BindTargetSet(cmd, colors, depth)) { skipped_++; return true; }
@@ -1155,13 +1161,14 @@ class Deko3dCommandProcessor : public CommandProcessor {
         dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
         dkCmdBufCopyImageToBuffer(cmd, &v, &r, &cb, 0);
         char name[96];
-        const char* tag = img->format == DkImageFormat_BGR5A1_Unorm ? " [1555]" : img->format == DkImageFormat_R16_Unorm ? " [r16]" : img->format == DkImageFormat_BGR565_Unorm ? " [565]" : "";
+        const char* tag = img->format == DkImageFormat_BGR5A1_Unorm ? " [1555]" : img->format == DkImageFormat_R16_Unorm ? " [r16]" : img->format == DkImageFormat_BGR565_Unorm ? " [565]" : img->format == DkImageFormat_R32_Float ? " [r32f]" : "";
         std::snprintf(name, sizeof(name), "%s%s %ux%u", what, tag, img->width, img->height);
         dumps.emplace_back(name, off);
       };
       queue_dump("front", front);
       for (auto& it : targets_) if (!it.second->is_depth) { char n[48]; std::snprintf(n, sizeof(n), "target base %u pitch %u", it.second->edram_base, it.second->edram_pitch); queue_dump(n, it.second); }
-      for (auto& it : guest_images_) if ((trace_frame || it.second->width >= 600) && it.second != front) { char n[48]; std::snprintf(n, sizeof(n), "guest %08X%s", it.first, it.second->from_resolve ? " (resolve)" : " (upload)"); queue_dump(n, it.second); }
+      for (int pass = 0; pass < 2; pass++)  // resolve images first: the staging buffer does not hold every image
+        for (auto& it : guest_images_) if ((trace_frame || it.second->width >= 600) && it.second != front && it.second->from_resolve == (pass == 0)) { char n[48]; std::snprintf(n, sizeof(n), "guest %08X%s", it.first, it.second->from_resolve ? " (resolve)" : " (upload)"); queue_dump(n, it.second); }
       dkCmdBufBarrier(cmd, DkBarrier_Full, 0);
     }
     // Inspect completed submissions before acquire can abort on a faulted queue, without waiting.
@@ -1303,6 +1310,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
                 } else if (d.first.find("[565]") != std::string::npos) {
                   const uint16_t p16 = reinterpret_cast<const uint16_t*>(px)[y * w + x];
                   r = ((p16 >> 11) & 31) * 255 / 31; g = ((p16 >> 5) & 63) * 255 / 63; b = (p16 & 31) * 255 / 31;
+                } else if (d.first.find("[r32f]") != std::string::npos) {  // depth: red = the value, green and blue = its finer digits
+                  const float v = reinterpret_cast<const float*>(px)[y * w + x];
+                  const float c = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+                  r = uint32_t(c * 255.0f); g = uint32_t(c * 65280.0f) & 255; b = uint32_t(c * 16711680.0f) & 255;
                 } else if (d.first.find("[r16]") != std::string::npos) {  // index texture: the high byte as grey, the low byte in blue
                   const uint16_t p16 = reinterpret_cast<const uint16_t*>(px)[y * w + x];
                   r = g = p16 >> 8; b = p16 & 255;
@@ -1876,8 +1887,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
       if (!child.depth_resolve || child.width != parent.width || !child.resolve_height ||
           child.resolve_pitch != parent.resolve_pitch || child.height < child.resolve_height) break;
       const uint32_t rows = std::min(child.resolve_height, parent.height - row);
-      parts[count++] = Part{&child, row, rows};
-      newest = std::max(newest, child.content_serial);
+      // A slice older than the parent's own resolve is the previous frame's (the scene depth: the whole 720 rows
+      // are resolved after the depth pass, then the first 384 again; the old second slice must not replace them).
+      if (child.content_serial >= parent.content_serial) {
+        parts[count++] = Part{&child, row, rows};
+        newest = std::max(newest, child.content_serial);
+      }
       row += rows;
     }
     if (!count || newest == parent.composed_child_serial) return;
