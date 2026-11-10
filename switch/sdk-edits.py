@@ -142,6 +142,36 @@ edit('include/rex/platform.h', [
      '#ifndef REX_PLATFORM_GNU_LINUX\n#define REX_PLATFORM_GNU_LINUX 0\n#endif\n#ifndef REX_PLATFORM_SWITCH\n#define REX_PLATFORM_SWITCH 0\n#endif\n'),
 ])
 
+# ARM64 FPCR (upstream SDK e007b1d + 6069ba1): mffs read the host rounding field back through the x86 MXCSR table,
+# so on the Switch a guest "toward +inf" read back as "toward -inf" and the reverse. FPCR.FZ16 is RES0 on the
+# Tegra X1 (no FP16 arithmetic): with it in the flush mask a word read back from the host never matched the mask.
+edit('include/rex/platform/fpscr.h', [
+    ('SIMDE_MM_ROUND_UP, SIMDE_MM_ROUND_DOWN};\n',
+     'SIMDE_MM_ROUND_UP, SIMDE_MM_ROUND_DOWN};\n'
+     '  // PowerPC FPSCR RN values indexed by the MXCSR RC field.\n'
+     '  static constexpr u32 HostToReX[] = {0, 3, 2, 1};\n'),
+    ('2 << RoundShift};\n',
+     '2 << RoundShift};\n'
+     '  // PowerPC FPSCR RN values indexed by the FPCR RMode field.\n'
+     '  static constexpr u32 HostToReX[] = {0, 2, 3, 1};\n'),
+    ('  // FZ and FZ16\n  static constexpr size_t FlushMask = (1 << 19) | (1 << 24);\n',
+     '  // FZ only (FZ16 is RES0 without FP16 arithmetic)\n  static constexpr size_t FlushMask = 1 << 24;\n'),
+])
+edit('include/rex/ppc/context.h', [
+    ('  static constexpr size_t HostToGuest[] = {kRoundNearest, kRoundDown, kRoundUp, kRoundTowardZero};\n\n', ''),
+    ('    return HostToGuest[(csr & RoundMaskVal) >> RoundShift];\n',
+     '    return Platform::HostToReX[(csr & RoundMaskVal) >> RoundShift];\n'),
+    ('  static constexpr size_t FlushMask = Platform::FlushMask;\n',
+     '  static constexpr size_t FlushMask = Platform::FlushMask;\n'
+     '  static_assert(\n'
+     '      [] {\n'
+     '        for (uint32_t rn = 0; rn <= kRoundMask; ++rn)\n'
+     '          if (Platform::HostToReX[(Platform::GuestToHost[rn] & RoundMaskVal) >> RoundShift] != rn) return false;\n'
+     '        return true;\n'
+     '      }(),\n'
+     '      "HostToReX must invert GuestToHost");\n'),
+])
+
 edit('include/rex/thread/fiber.h', [
     ('#include <ucontext.h>\n', '#if !REX_PLATFORM_SWITCH\n#include <ucontext.h>\n#endif\n'),
     ('  ucontext_t context_{};\n',

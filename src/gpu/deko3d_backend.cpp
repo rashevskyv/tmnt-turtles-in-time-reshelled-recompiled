@@ -738,6 +738,14 @@ class Deko3dCommandProcessor : public CommandProcessor {
       const uint32_t* fw = reinterpret_cast<const uint32_t*>(&fetch);
       uint64_t bind_key = ps->ucode_data_hash() ^ (uint64_t(tb_index++) * 0x9E3779B97F4A7C15ull);
       for (int i = 0; i < 6; i++) bind_key = (bind_key ^ fw[i]) * 0x100000001B3ull;
+      if (fetch.exp_adjust) {
+        // D3D12 and the patched Vulkan backend scale the fetched value by 2^exp_adjust (upstream patch 0034); this
+        // backend does not. The log says whether the game uses it (a darker image or a lost glow if so).
+        char key[48];
+        std::snprintf(key, sizeof key, "expadj %u %d", tb.fetch_constant, int(fetch.exp_adjust));
+        LogOnce(key, "texture fetch %u exp_adjust %d (x%g) in PS %016llX: not applied", tb.fetch_constant, int(fetch.exp_adjust),
+                std::ldexp(1.0, int(fetch.exp_adjust)), (unsigned long long)ps->ucode_data_hash());
+      }
       if (fetch.dimension == xenos::DataDimension::kCube) {
         // Not through the per-frame bind cache: CubeImage checks its 6 x levels sources itself.
         TextureInfo info;
