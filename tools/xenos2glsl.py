@@ -819,6 +819,10 @@ def translate_file(path):
     if t.needs_ssbo:
         # A computed fetch index somewhere: every stream of this shader goes through storage buffers.
         glsl, meta = Translator(text, stage, name, ssbo=True).translate()
+        # The backend bounds such a shader's streams by the game's instancing divisor, trunc(c19.x)
+        # (deko3d_backend.cpp, stream_vertices): a shader with another index formula must not ship silently.
+        if 'trunc(c[19].x' not in glsl:
+            raise SystemExit('%s: storage-buffer shader without the c19.x instancing divisor' % name)
     return glsl, meta
 
 
