@@ -93,6 +93,8 @@ target_link_options(tmnt PRIVATE
     -Wl,--wrap=rmutexLock
     -Wl,--wrap=rmutexTryLock
     -Wl,--wrap=rmutexUnlock
+    -Wl,--wrap=nvGpuChannelKickoff
+    -Wl,--wrap=nvGpuChannelAppendEntry
     -Wl,-u,vk_icdGetInstanceProcAddr
 )
 # zstd, expat and zlib from devkitPro portlibs (the SDK links them on Linux through the system).

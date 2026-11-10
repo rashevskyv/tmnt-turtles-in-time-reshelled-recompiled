@@ -58,6 +58,7 @@
 
 extern "C" volatile unsigned rex_nx_swaps;     // switch_nx.cpp: the busy/frame line divides by it
 extern "C" volatile double rex_nx_main_busy_ms;  // switch_nx.cpp: the main thread's busy ms per frame
+extern "C" volatile unsigned rex_nx_kick_max;  // switch_nx.cpp: most gpfifo entries in one GPU submit
 extern "C" void rex_nx_waited_add(unsigned long long ticks);  // switch_nx.cpp: the busy/frame line
 #include "../../switch/host/include/rex/nx_menu.h"  // switch/host/nx_menu.cpp: the settings and the overlay the present pass draws
 #ifndef TMNT_DK_GL
@@ -68,6 +69,7 @@ extern "C" volatile int rex_nx_vblank_divider;  // SDK graphics_system.cpp (sdk-
 volatile int rex_nx_vblank_divider = 1;
 volatile unsigned rex_nx_swaps = 0;  // no switch_nx.cpp on the Linux test host
 volatile double rex_nx_main_busy_ms = 0;
+volatile unsigned rex_nx_kick_max = 0;
 extern "C" void rex_nx_waited_add(unsigned long long) {}
 extern "C" int rex_nx_setting_fps_mode(void) { return 0; }  // no menu on the Linux test host
 extern "C" int rex_nx_setting_fps_counter(void) { return 1; }
@@ -158,6 +160,7 @@ void DebugCallback(void*, const char* context, DkResult result, const char* mess
   Log("deko3d %s: result %d: %s", context ? context : "?", int(result), message ? message : "");
   std::fflush(stdout);  // deko3d aborts right after an error (console 0.56: the message was lost)
   if (g_dk_fault_dump && !dumped) { dumped = true; g_dk_fault_dump(context ? context : "deko3d error"); }
+  fsync(fileno(stdout));  // on the card before the abort, without the log thread's next half second
 }
 
 struct MemBlock {
@@ -1422,8 +1425,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     hud_window_swaps_++;
     const double elapsed = std::chrono::duration<double>(now - hud_window_start_).count();
     if (elapsed >= 1.0) {
-      // fps, then the main thread's busy ms per frame (switch_nx.cpp's busy line): "36 9.8".
-      std::snprintf(hud_text_, sizeof(hud_text_), "%.0f %.1f", hud_window_swaps_ / elapsed, rex_nx_main_busy_ms);
+      // Frames drawn per second, then the main thread's busy ms per guest frame (switch_nx.cpp's busy line; the
+      // game makes 60 guest frames a second, so above 16.7 it runs slow): "30 FPS  CPU 18.7 MS".
+      std::snprintf(hud_text_, sizeof(hud_text_), "%.0f FPS  CPU %.1f MS", hud_window_swaps_ / elapsed, rex_nx_main_busy_ms);
       std::sort(shown_ms_.begin(), shown_ms_.end());
       const size_t sn = shown_ms_.size();
       const size_t le34 = std::upper_bound(shown_ms_.begin(), shown_ms_.end(), 34.0) - shown_ms_.begin();
@@ -1443,11 +1447,13 @@ class Deko3dCommandProcessor : public CommandProcessor {
         heap_arena = size_t(mi.arena);
 #endif
         std::printf("[nx] dk memory: malloc %zu MB in use of %zu MB arena; images %u MB of %u (%u made, %zu free); shader code %u KB of %u (%zu shaders); "
-                    "stream cache %u MB of %u (%zu copies, %u resets); frame data peak %u KB of %u, staging peak %u KB of %u; ring flushes %u\n",
+                    "stream cache %u MB of %u (%zu copies, %u resets); frame data peak %u KB of %u, staging peak %u KB of %u; ring flushes %u; "
+                    "gpfifo entries in one kickoff: max %u of 2048%s\n",
                     heap_used >> 20, heap_arena >> 20, images_.used >> 20, images_.size >> 20, image_count_, free_images_.size(),
                     code_.used >> 10, code_.size >> 10, shaders_.size(), stream_cache_.used >> 20, stream_cache_.size >> 20, copies_.size(),
                     cache_resets_, std::max(frames_[0].data.peak, frames_[1].data.peak) >> 10, frames_[0].data.size >> 10,
-                    std::max(frames_[0].staging.peak, frames_[1].staging.peak) >> 10, frames_[0].staging.size >> 10, ring_flushes_);
+                    std::max(frames_[0].staging.peak, frames_[1].staging.peak) >> 10, frames_[0].staging.size >> 10, ring_flushes_,
+                    unsigned(rex_nx_kick_max), gpu_checkpoints_ ? " (dk_gpu_checkpoints is on)" : "");
       }
       shown_ms_.clear();
       texbind_hits_ = late_writes_ = 0;
@@ -3220,7 +3226,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   uint32_t data_peak_ = 0;  // the fullest frame data ring of the second, bytes
   uint32_t texbind_hits_ = 0;  // texture bindings served by the frame's cache
   bool vs_consts_dirty_ = true, ps_consts_dirty_ = true;  // WriteRegister
-  char hud_text_[9] = "";  // what the present pass draws top-left (fps, one decimal)
+  char hud_text_[32] = "";  // what the present pass draws top-left ("30 FPS  CPU 18.7 MS")
   uint32_t image_count_ = 0, uploads_ = 0, reuploads_ = 0;
   uint64_t upload_bytes_ = 0;
   uint32_t frame_draws_ = 0, frame_clears_ = 0, frame_resolves_ = 0, frame_skipped_ = 0, frame_missing_ = 0, frame_reuploads_ = 0;

@@ -186,6 +186,47 @@ volatile unsigned rex_nx_swaps = 0;
 extern "C" volatile double rex_nx_main_busy_ms;  // the main thread's busy ms per frame of the last period (the HUD)
 volatile double rex_nx_main_busy_ms = 0;
 
+// deko3d's GPU command submits (linker --wrap, switch.cmake). Console 0.82 died in the first level frames with
+// "deko3d error (1) in dkQueuePresentImage - gpu channel kickoff failed, but no error was reported": the submit
+// ioctl failed, the channel had no error notification, the previous frame was still running on the GPU and no
+// command of the rejected frame had run. The channel's gpfifo holds GPFIFO_QUEUE_SIZE (2048) entries; a full barrier
+// costs two, and the dk_gpu_checkpoints marker (one barrier per draw) made those two frames about 1390 + 1000
+// entries. libnx retries NvError_Busy only and the code was lost. So: a failed submit without a channel error is
+// logged with its code and retried for 2 s while the GPU drains its queue. A channel error returns at once.
+// ponytail: the cause (a full gpfifo) is inferred, not measured; the "kickoff" lines of the next console log decide.
+extern "C" volatile unsigned rex_nx_kick_max;  // most gpfifo entries in one submit (the dk memory line)
+volatile unsigned rex_nx_kick_max = 0;
+extern "C" Result __real_nvGpuChannelKickoff(NvGpuChannel* c);
+extern "C" Result __wrap_nvGpuChannelKickoff(NvGpuChannel* c) {
+    const u32 entries = c->num_entries;
+    if (entries > rex_nx_kick_max) rex_nx_kick_max = entries;
+    Result rc = __real_nvGpuChannelKickoff(c);
+    if (R_SUCCEEDED(rc)) return rc;
+    NvNotification notif{};
+    const bool channel_error = R_SUCCEEDED(nvGpuChannelGetErrorNotification(c, &notif)) && notif.status;
+    std::printf("[nx] gpu: kickoff of %u gpfifo entries failed, rc 0x%X (module %u, description %u), channel error %d\n",
+                entries, rc, R_MODULE(rc), R_DESCRIPTION(rc), int(channel_error));
+    int tries = 0;
+    for (; !channel_error && R_FAILED(rc) && tries < 400; tries++) {
+        svcSleepThread(5'000'000);
+        rc = __real_nvGpuChannelKickoff(c);
+    }
+    std::printf("[nx] gpu: kickoff %s after %d retries (%d ms), rc 0x%X\n", R_SUCCEEDED(rc) ? "passed" : "failed", tries, tries * 5, rc);
+    std::fflush(stdout);
+    fsync(fileno(stdout));
+    return rc;
+}
+// libnx submits by itself when its entry array fills up (deko3d's AutoKick threshold): that call is inside libnx
+// and is not wrapped, so the same submit is made here first.
+extern "C" Result __real_nvGpuChannelAppendEntry(NvGpuChannel* c, iova_t start, size_t num_cmds, u32 flags, u32 flush_threshold);
+extern "C" Result __wrap_nvGpuChannelAppendEntry(NvGpuChannel* c, iova_t start, size_t num_cmds, u32 flags, u32 flush_threshold) {
+    if (flush_threshold < GPFIFO_QUEUE_SIZE && c->num_entries >= GPFIFO_QUEUE_SIZE - flush_threshold) {
+        const Result rc = __wrap_nvGpuChannelKickoff(c);
+        if (R_FAILED(rc)) return rc;
+    }
+    return __real_nvGpuChannelAppendEntry(c, start, num_cmds, flags, flush_threshold);
+}
+
 void register_thread(Thread* thread, const char* name) {
     mutexLock(&nx_threads_lock);
     for (NxThread& t : nx_threads) {
