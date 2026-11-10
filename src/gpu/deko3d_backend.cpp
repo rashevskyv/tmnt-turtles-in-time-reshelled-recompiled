@@ -12,6 +12,7 @@
 #ifdef __SWITCH__
 #include <switch.h>
 #include <deko3d.h>
+#include <malloc.h>  // mallinfo: the dk memory line
 #else
 #define TMNT_DK_GL 1
 #include "dk_gl/switch.h"
@@ -112,6 +113,13 @@ namespace {
 constexpr uint32_t kFrames = 2;
 constexpr uint32_t kFrameDataBytes = 24u << 20;  // vertex, index and uniform data of one frame
 constexpr uint32_t kFrameCmdBytes = 4u << 20;
+// Less than this left in the frame data ring at a draw: the frame is flushed and the ring starts again (FlushFrameData).
+constexpr uint32_t kFlushReserveBytes = 4u << 20;
+// Copies of guest vertex and index data that stay current across frames (FindCopy).
+// ponytail: a bump block, emptied when full (BeginFrame drains the queue first); a free list if a level's static
+// geometry ever exceeds it (the "stream cache ... resets" count of the dk memory line).
+constexpr uint32_t kStreamCacheBytes = 64u << 20;
+constexpr uint32_t kInCache = UINT32_MAX;  // GuestCopy::frame
 // One frame's texture uploads. The first stage's backdrop layers are 4320x2432 RGBA8 textures (41 MB each): a
 // texture larger than this is not uploaded at all ("staging ring full") and its draws sample nothing. 96 MB holds
 // both layers in the stage's first frame (72 MB held one; the second came a frame later, tiles missing meanwhile).
@@ -214,6 +222,19 @@ class DkShaderObj : public Shader {
   DkShader geom{};           // vertex shaders: the rectangle-list geometry shader
   bool geom_loaded = false;
   bool ssbo = false;         // vertex shaders: computed fetch indices; the streams are storage buffers (xenos2glsl .ssbo)
+  uint32_t uni_bytes = 0;    // the float constants up to the highest one the shader reads, in 256-byte steps (UniformBytes)
+};
+
+// One copy of guest vertex or index bytes (FindCopy): in a frame's data ring (current in that frame only) or in the
+// stream cache (current until the guest writes the bytes).
+struct GuestCopy {
+  uint32_t address = 0, bytes = 0, tag = 0;
+  uint32_t frame = 0;   // 0 = no copy, kInCache, or the frame serial of a ring copy
+  uint32_t serial = 0;  // the draw serial when the copy was made
+  DkGpuAddr gpu = 0;
+  uint8_t ends[64] = {};  // the guest bytes at the two ends when the copy was made
+  uint32_t max_index = 0, min_index = 0, restart_hits = 0;  // indices: what the copy loop found
+  bool has_vertex = false;
 };
 
 struct SysConstants {
@@ -248,13 +269,6 @@ struct Frame {
     bool from_resolve, split_candidate;
   };
   std::unordered_map<uint64_t, TexBind> texbinds;
-  // Vertex streams already copied into `data` in this frame (CopyStream): guest address, size and endianness -> the
-  // copy's offset and the guest bytes at its two ends when it was made.
-  struct StreamCopy {
-    uint32_t off;
-    uint8_t ends[64];
-  };
-  std::unordered_map<uint64_t, StreamCopy> streams;
   // GPU timestamps: pipeline top at the frame's first command, bottom before the present (16-byte reports).
   uint32_t ts_off = UINT32_MAX;
   MemBlock checkpoint_data;  // optional GPU report storage, separate from the frame ring
@@ -480,6 +494,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
         !images_.Create(device_, kImagePoolBytes, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image) ||
         !descriptors_.Create(device_, DK_MEMBLOCK_ALIGNMENT * 4 * kFrames + DK_MEMBLOCK_ALIGNMENT * 2 +
                              ((kSamplerCount * sizeof(DkSamplerDescriptor) + DK_MEMBLOCK_ALIGNMENT - 1) & ~size_t(DK_MEMBLOCK_ALIGNMENT - 1)), ring_flags) ||
+        !stream_cache_.Create(device_, kStreamCacheBytes, ring_flags) ||
         !cmdmem_.Create(device_, kFrameCmdBytes * kFrames, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached)) {
       Log("memory block creation failed");
       return false;
@@ -665,6 +680,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (!PrimitiveOf(prim_type, prim, rects)) { LogOnce("prim", "unsupported primitive type %u", uint32_t(prim_type)); skipped_++; return true; }
     Frame& f = frames_[frame_];
     DkCmdBuf cmd = f.cmdbuf;
+    if (f.data.size - f.data.used < kFlushReserveBytes) FlushFrameData(f);
     const uint64_t pair_key = vs->ucode_data_hash() * 0x9E3779B97F4A7C15ull ^ ps->ucode_data_hash();
     if (FirstTime(pair_key)) {
       // Each shader pair's first draw, once: the state a new kind of draw comes with.
@@ -950,13 +966,13 @@ class Deko3dCommandProcessor : public CommandProcessor {
     uint32_t attrib_count = 0, buffer_count = 0, ssbo_count = 0;
     uint32_t vertex_count = index_count;
     uint32_t min_index = 0;  // the lowest vertex index the draw reads
-    uint32_t index_offset = UINT32_MAX;
+    DkGpuAddr index_gpu = 0;
     uint32_t restart_index = regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx;
     bool restart = index_buffer_info && su.multi_prim_ib_ena && SupportsPrimitiveReset(prim_type) &&
                    (index_buffer_info->format != xenos::IndexFormat::kInt16 || restart_index <= UINT16_MAX);
     if (index_buffer_info) {
       uint32_t restart_hits = 0;
-      if (!CopyIndices(f, *index_buffer_info, restart, restart_index, index_offset, vertex_count, min_index, restart_hits)) { skipped_++; return true; }
+      if (!CopyIndices(f, *index_buffer_info, restart, restart_index, index_gpu, vertex_count, min_index, restart_hits)) { skipped_++; return true; }
       if (restart_hits) LogOnce("primrestart", "primitive restart VS %016llX PS %016llX prim %u index %06X: %u of %u indices",
                                 (unsigned long long)vs->ucode_data_hash(), (unsigned long long)ps->ucode_data_hash(),
                                 uint32_t(prim_type), restart_index, restart_hits, index_buffer_info->count);
@@ -1031,18 +1047,21 @@ class Deko3dCommandProcessor : public CommandProcessor {
                 first_vertex, stride, bytes, vb.fetch_constant, avail, (unsigned long long)vs->ucode_data_hash());
         bytes = avail;
       }
-      const uint32_t before = vtx_copied_bytes_;
-      const uint32_t off = CopyStream(f, (fetch.address << 2) + skip, fetch.endian, bytes);
-      if (off == UINT32_MAX) { RingFull(f, "vertices", bytes, vs->ucode_data_hash()); skipped_++; return true; }
-      copied_bytes += vtx_copied_bytes_ - before;
+      uint8_t* write;
+      const GuestCopy* copy = FindCopy(f, (fetch.address << 2) + skip, bytes, uint32_t(fetch.endian), write);
+      if (!copy) { RingFull(f, "vertices", bytes, vs->ucode_data_hash()); skipped_++; return true; }
+      if (write) {
+        texture_conversion::CopySwapBlock(fetch.endian, write, memory_->TranslatePhysical((fetch.address << 2) + skip), bytes);
+        copied_bytes += bytes;
+      }
       if (vs->ssbo) {
         // The shader computes its record addresses (floor(index) * stride + offset) and bounds-checks them against
         // this size; every index it derives from the vertex id is at most the vertex id, so the per-vertex extent
         // bounds the stream. Binding = the SDK's vertex binding index, the order xenos2glsl numbers the buffers.
-        dkCmdBufBindStorageBuffer(cmd, DkStage_Vertex, ssbo_count++, f.data.gpu + off, bytes);
+        dkCmdBufBindStorageBuffer(cmd, DkStage_Vertex, ssbo_count++, copy->gpu, bytes);
         continue;
       }
-      dkCmdBufBindVtxBuffer(cmd, buffer_count, f.data.gpu + off, bytes);
+      dkCmdBufBindVtxBuffer(cmd, buffer_count, copy->gpu, bytes);
       buffers[buffer_count] = DkVtxBufferState{stride, 0};
       for (const auto& a : vb.attributes) {
         if (attrib_count >= DK_MAX_VERTEX_ATTRIBS) break;
@@ -1080,7 +1099,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     dkCmdBufSetPrimitiveRestart(cmd, restart, restart_index);
     if (index_buffer_info) {
       dkCmdBufBindIdxBuffer(cmd, index_buffer_info->format == xenos::IndexFormat::kInt32 ? DkIdxFormat_Uint32 : DkIdxFormat_Uint16,
-                            f.data.gpu + index_offset);
+                            index_gpu);
       dkCmdBufDrawIndexed(cmd, prim, index_count, 1, 0, vs->ssbo ? 0 : -int32_t(min_index), 0);
     } else {
       dkCmdBufDraw(cmd, prim, index_count, 1, 0, 0);
@@ -1401,18 +1420,34 @@ class Deko3dCommandProcessor : public CommandProcessor {
       const size_t sn = shown_ms_.size();
       const size_t le34 = std::upper_bound(shown_ms_.begin(), shown_ms_.end(), 34.0) - shown_ms_.begin();
       std::printf("[nx] dk time/s: draws+resolves %.0f ms, acquire %.0f ms, fence wait %.0f ms, gpu %.0f ms/%u frames, over %u frames (%.0f ms window); "
-                  "draw phases ms: sync %.0f setup %.0f tex %.0f state %.0f vtx %.0f uni %.0f draw %.0f; uniform uploads vs %u ps %u sys %u; vertex data copied %u KB reused %u KB, frame data peak %u KB; texture bind hits %u; late writes %u; "
+                  "draw phases ms: sync %.0f setup %.0f tex %.0f state %.0f vtx %.0f uni %.0f draw %.0f; uniform uploads vs %u ps %u sys %u; vertex data copied %u KB cached %u KB reused %u KB, frame data peak %u KB; texture bind hits %u; late writes %u; "
                   "shown %zu: interval p50 %.1f p95 %.1f ms, %zu%% <= 34 ms\n",
                   t_draw_ms_, t_acquire_ms_, t_fence_ms_, t_gpu_ms_, gpu_frames_, hud_window_swaps_, elapsed * 1000.0, t_phase_ms_[0], t_phase_ms_[1],
                   t_phase_ms_[2], t_phase_ms_[3], t_phase_ms_[4], t_phase_ms_[5], t_phase_ms_[6], uni_uploads_[0], uni_uploads_[1],
-                  uni_uploads_[2], vtx_copied_bytes_ >> 10, vtx_reused_bytes_ >> 10, data_peak_ >> 10, texbind_hits_, late_writes_, sn, sn ? shown_ms_[sn / 2] : 0.0, sn ? shown_ms_[sn * 95 / 100] : 0.0, sn ? le34 * 100 / sn : 0);
+                  uni_uploads_[2], vtx_copied_bytes_ >> 10, vtx_cached_bytes_ >> 10, vtx_reused_bytes_ >> 10, data_peak_ >> 10, texbind_hits_, late_writes_, sn, sn ? shown_ms_[sn / 2] : 0.0, sn ? shown_ms_[sn * 95 / 100] : 0.0, sn ? le34 * 100 / sn : 0);
+      // Every 10th window: what the port holds. All of it is bounded: the pools are created once at their full size
+      // (the owner saw eden.exe at 44 GB after a 0.80 run; a number here that grows without bound would be ours).
+      if (mem_log_windows_++ % 10 == 0) {
+        size_t heap_used = 0, heap_arena = 0;
+#ifndef TMNT_DK_GL
+        const struct mallinfo mi = mallinfo();
+        heap_used = size_t(mi.uordblks);
+        heap_arena = size_t(mi.arena);
+#endif
+        std::printf("[nx] dk memory: malloc %zu MB in use of %zu MB arena; images %u MB of %u (%u made, %zu free); shader code %u KB of %u (%zu shaders); "
+                    "stream cache %u MB of %u (%zu copies, %u resets); frame data peak %u KB of %u, staging peak %u KB of %u; ring flushes %u\n",
+                    heap_used >> 20, heap_arena >> 20, images_.used >> 20, images_.size >> 20, image_count_, free_images_.size(),
+                    code_.used >> 10, code_.size >> 10, shaders_.size(), stream_cache_.used >> 20, stream_cache_.size >> 20, copies_.size(),
+                    cache_resets_, std::max(frames_[0].data.peak, frames_[1].data.peak) >> 10, frames_[0].data.size >> 10,
+                    std::max(frames_[0].staging.peak, frames_[1].staging.peak) >> 10, frames_[0].staging.size >> 10, ring_flushes_);
+      }
       shown_ms_.clear();
       texbind_hits_ = late_writes_ = 0;
       t_draw_ms_ = t_acquire_ms_ = t_fence_ms_ = t_gpu_ms_ = 0;
       gpu_frames_ = 0;
       for (double& t : t_phase_ms_) t = 0;
       for (uint32_t& u : uni_uploads_) u = 0;
-      vtx_copied_bytes_ = vtx_reused_bytes_ = data_peak_ = 0;
+      vtx_copied_bytes_ = vtx_cached_bytes_ = vtx_reused_bytes_ = data_peak_ = 0;
       hud_window_start_ = now;
       hud_window_swaps_ = 0;
     }
@@ -1656,7 +1691,20 @@ class Deko3dCommandProcessor : public CommandProcessor {
     f.staging.Reset();
     f.next_descriptor = 0;
     f.descriptors.clear();
-    f.streams.clear();
+    frame_serial_++;
+    if (cache_full_) {
+      // ponytail: the whole stream cache is emptied (the GPU first finishes the frames that read it); the next
+      // frames copy through the ring and fill it again.
+      dkQueueWaitIdle(queue_);
+      stream_cache_.Reset();
+      copies_.clear();
+      cache_full_ = false;
+      cache_resets_++;
+    } else if (copies_.size() > copies_prune_at_) {
+      // Ring copies of frames long past (the dynamic buffer's streams have a new address or size every frame).
+      std::erase_if(copies_, [&](const auto& e) { return e.second.frame != kInCache && e.second.frame + 8 < frame_serial_; });
+      copies_prune_at_ = std::max<size_t>(8192, copies_.size() * 2);
+    }
     f.texbinds.clear();
     dkCmdBufClear(f.cmdbuf);
     dkCmdBufAddMemory(f.cmdbuf, cmdmem_.block, f.cmd_offset, kFrameCmdBytes);
@@ -2035,6 +2083,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
       }
       if (img->width == width && img->height == height) return img;
       if (at_least && width <= img->width && height <= img->height) return img;
+      // A resolve rectangle is aligned to 8 pixels and the fetch asks for the exact size: 320x184 over a 320x180
+      // image keeps the image (the resolve clips its rectangle). 0.80 resized three bloom images twice every frame.
+      if (at_least && img->from_resolve && width <= ((img->width + 7) & ~7u) && height <= ((img->height + 7) & ~7u)) return img;
       if (at_least) {
         width = std::max(width, img->width);
         height = std::max(height, img->height);
@@ -2470,50 +2521,108 @@ class Deko3dCommandProcessor : public CommandProcessor {
   }
 
   // ----- draws ----------------------------------------------------------------------------------
-  // A vertex stream's bytes in the frame ring: the offset, or UINT32_MAX when the ring is full. The game draws a
-  // mesh once per pass (depth, lighting, ...) and once per instance: one copy serves every draw of the frame that
-  // reads the same guest bytes (Eden 0.80, level 1: each frame filled the 24 MB ring and lost its last 11-21 draws,
-  // the final composite and the HUD; the vertex phase was 120 ms of a 190 ms frame).
-  // ponytail: a copy is reused when the guest bytes at its two ends (32 + 32) are unchanged; write watches
-  // (SyncDirtyPages) if the game ever rewrites the middle of a stream between two draws of one frame.
-  uint32_t CopyStream(Frame& f, uint32_t guest_address, xenos::Endian endian, uint32_t bytes) {
+  // The host copy of guest vertex or index bytes (`tag`: the conversion). `write` is where the caller must write the
+  // converted bytes, or null when an earlier copy serves. Null result: the frame ring is full.
+  // The game draws a mesh once per pass (depth, lighting, ...) and once per instance: one ring copy serves every
+  // draw of the frame (Eden 0.80, level 1: each frame filled the 24 MB ring and lost its last 11-21 draws, the final
+  // composite and the HUD). Bytes the guest did not write since their last copy move to the stream cache and serve
+  // every later frame: in Eden a byte written into GPU-bound memory costs ~5 us per KB (0.78: 18.7 MB and 30 ms a frame).
+  // ponytail: a ring copy is reused within its frame when the guest bytes at its two ends (32 + 32) are unchanged,
+  // without the page marks (a page of the dynamic buffer is written many times a frame); the marks too if the game
+  // ever rewrites only the middle of a stream between two draws of one frame.
+  GuestCopy* FindCopy(Frame& f, uint32_t guest_address, uint32_t bytes, uint32_t tag, uint8_t*& write) {
+    write = nullptr;
     const uint8_t* src = memory_->TranslatePhysical(guest_address);
     const uint32_t edge = std::min(bytes, 32u);
     uint8_t ends[64] = {};
     std::memcpy(ends, src, edge);
     std::memcpy(ends + 32, src + bytes - edge, edge);
-    const uint64_t key = uint64_t(guest_address) | uint64_t(bytes) << 32 | uint64_t(endian) << 62;  // bytes < 2^26
-    auto it = f.streams.find(key);
-    if (it != f.streams.end() && !std::memcmp(it->second.ends, ends, sizeof(ends))) {
+    GuestCopy& c = copies_[(uint64_t(guest_address) | uint64_t(bytes) << 32) ^ uint64_t(tag) * 0x9E3779B97F4A7C15ull];
+    const bool same = c.frame && c.address == guest_address && c.bytes == bytes && c.tag == tag && !std::memcmp(c.ends, ends, sizeof(ends));
+#ifdef TMNT_DK_GL
+    const bool unwritten = false;  // no page marks on Linux: ring copies only
+#else
+    const bool unwritten = same && !WrittenSince(guest_address, bytes, c.serial);
+#endif
+    if (same && (c.frame == kInCache ? unwritten : c.frame == frame_serial_)) {
       vtx_reused_bytes_ += bytes;
-      return it->second.off;
+      return &c;
     }
-    const uint32_t off = f.data.Alloc(bytes ? bytes : 16, 256);
-    if (off == UINT32_MAX) return off;
-    texture_conversion::CopySwapBlock(endian, f.data.cpu + off, src, bytes);
-    vtx_copied_bytes_ += bytes;
-    Frame::StreamCopy& copy = f.streams[key];
-    copy.off = off;
-    std::memcpy(copy.ends, ends, sizeof(ends));
-    return off;
+    const uint32_t size = bytes ? bytes : 16;
+    uint32_t off = UINT32_MAX;
+    MemBlock* block = &f.data;
+    if (unwritten && !cache_full_) {
+      off = stream_cache_.Alloc(size, 256);
+      if (off == UINT32_MAX) cache_full_ = true; else block = &stream_cache_;
+    }
+    if (off == UINT32_MAX) off = f.data.Alloc(size, 256);
+    if (off == UINT32_MAX) { c.frame = 0; return nullptr; }
+    c.address = guest_address;
+    c.bytes = bytes;
+    c.tag = tag;
+    c.frame = block == &stream_cache_ ? kInCache : frame_serial_;
+    c.serial = serial_;
+    c.gpu = block->gpu + off;
+    std::memcpy(c.ends, ends, sizeof(ends));
+    (block == &stream_cache_ ? vtx_cached_bytes_ : vtx_copied_bytes_) += bytes;
+    write = block->cpu + off;
+    return &c;
+  }
+
+  // The float constants a shader reads, as bytes from c0 in 256-byte steps (the uniform buffer alignment): the size of
+  // its block in the ring. Eden's cost is per 4 KB page written, and a whole 4 KB block per upload was 2.9 MB a frame.
+  static uint32_t UniformBytes(DkShaderObj* shader) {
+    if (!shader->uni_bytes) {
+      const auto& map = shader->constant_register_map();
+      uint32_t top = 0;  // the highest register read + 1
+      for (uint32_t w = 0; w < 4; w++) if (map.float_bitmap[w]) top = w * 64 + uint32_t(std::bit_width(uint64_t(map.float_bitmap[w])));
+      shader->uni_bytes = std::max(256u, (top * 16 + 255) & ~255u);
+    }
+    return shader->uni_bytes;
+  }
+
+  // The frame data ring is nearly full in the middle of a frame: the draws so far go to the GPU, and the ring starts
+  // again once they are done. No draw is dropped (0.80 lost the composite and the HUD: blue and black frames).
+  void FlushFrameData(Frame& f) {
+    dkQueueSubmitCommands(queue_, dkCmdBufFinishList(f.cmdbuf));
+    dkQueueWaitIdle(queue_);
+    data_peak_ = std::max(data_peak_, f.data.used);
+    f.data.used = f.ts_off != UINT32_MAX ? f.ts_off + 32 : 0;  // the frame's timestamps stay
+    frame_serial_++;  // the ring copies of FindCopy are gone
+    f.vs_uni = f.ps_uni = f.sys_uni = UINT32_MAX;
+    f.vs_uni_shader = f.ps_uni_shader = nullptr;
+    ring_flushes_++;
   }
 
   bool CopyIndices(Frame& f, const IndexBufferInfo& ib, bool restart, uint32_t restart_index,
-                   uint32_t& offset_out, uint32_t& vertex_count_out, uint32_t& min_index_out, uint32_t& restart_hits) {
+                   DkGpuAddr& gpu_out, uint32_t& vertex_count_out, uint32_t& min_index_out, uint32_t& restart_hits) {
     const uint32_t index_size = ib.format == xenos::IndexFormat::kInt32 ? 4 : 2;
     if (ib.length > UINT32_MAX || uint64_t(ib.count) * index_size > ib.length) {
       LogOnce("indexrange", "invalid index buffer: %u indices, %zu bytes", ib.count, ib.length);
       return false;
     }
-    uint32_t bytes = uint32_t(ib.length);
-    uint32_t off = f.data.Alloc(bytes, 64);
-    if (off == UINT32_MAX) return RingFull(f, "indices", bytes, 0);
+    // The copy and what its loop found (the index range, the restart hits) serve every later draw of the same indices.
+    const uint32_t bytes = ib.count * index_size;
+    const uint32_t tag = 4u | uint32_t(index_size == 4) << 3 | uint32_t(restart) << 4 | uint32_t(ib.endianness) << 5 |
+                         (restart ? (restart_index & 0xFFFFFFu) << 8 : 0u);
+    uint8_t* write;
+    GuestCopy* copy = FindCopy(f, ib.guest_base, bytes, tag, write);
+    if (!copy) return RingFull(f, "indices", bytes, 0);
+    gpu_out = copy->gpu;
+    if (!write) {
+      restart_hits += copy->restart_hits;
+      if (copy->has_vertex && copy->max_index == UINT32_MAX) return false;
+      vertex_count_out = copy->has_vertex ? copy->max_index + 1 : 0;
+      min_index_out = copy->has_vertex ? copy->min_index : 0;
+      return true;
+    }
+    const uint32_t hits_before = restart_hits;
     const uint8_t* src = memory_->TranslatePhysical(ib.guest_base);
     uint32_t max_index = 0, min_index = UINT32_MAX;
     bool has_vertex = false;
     if (ib.format == xenos::IndexFormat::kInt32) {
       const uint32_t* s = reinterpret_cast<const uint32_t*>(src);
-      uint32_t* d = reinterpret_cast<uint32_t*>(f.data.cpu + off);
+      uint32_t* d = reinterpret_cast<uint32_t*>(write);
       for (uint32_t i = 0; i < ib.count; i++) {
         uint32_t v = xenos::GpuSwap(s[i], ib.endianness);
         if (restart) v &= xenos::kVertexIndexMask;
@@ -2525,7 +2634,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       }
     } else {
       const uint16_t* s = reinterpret_cast<const uint16_t*>(src);
-      uint16_t* d = reinterpret_cast<uint16_t*>(f.data.cpu + off);
+      uint16_t* d = reinterpret_cast<uint16_t*>(write);
       auto endian = ib.endianness == xenos::Endian::k8in32 ? xenos::Endian::k8in16 :
                     ib.endianness == xenos::Endian::k16in32 ? xenos::Endian::kNone : ib.endianness;
       for (uint32_t i = 0; i < ib.count; i++) {
@@ -2537,7 +2646,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
         if (v < min_index) min_index = v;
       }
     }
-    offset_out = off;
+    copy->max_index = max_index;
+    copy->min_index = min_index;
+    copy->has_vertex = has_vertex;
+    copy->restart_hits = restart_hits - hits_before;
     if (has_vertex && max_index == UINT32_MAX) { LogOnce("indexmax", "vertex index is too large"); return false; }
     vertex_count_out = has_vertex ? max_index + 1 : 0;
     min_index_out = has_vertex ? min_index : 0;
@@ -2566,9 +2678,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // another span of them; only the runs of float constants the shader reads are copied (dynamic indexing sets
     // every bit). The deko3d binding is sticky within the frame's command buffer: rebind on a new block only.
     bool bind_vs = false, bind_ps = false;
+    // A block holds only UniformBytes of the 4096 its binding spans: the binding must end inside the ring.
     if (vs_consts_dirty_ || f.vs_uni == UINT32_MAX || f.vs_uni_shader != vs) {
-      const uint32_t off = f.data.Alloc(4096, DK_UNIFORM_BUF_ALIGNMENT);
-      if (off == UINT32_MAX) return RingFull(f, "uniforms", 4096, vs->ucode_data_hash());
+      const uint32_t off = f.data.Alloc(UniformBytes(vs), DK_UNIFORM_BUF_ALIGNMENT);
+      if (off == UINT32_MAX || off + 4096 > f.data.size) return RingFull(f, "uniforms", 4096, vs->ucode_data_hash());
       CopyConstantSpan(f.data.cpu + off, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], vs);
       f.vs_uni = off;
       f.vs_uni_shader = vs;
@@ -2577,8 +2690,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
       uni_uploads_[0]++;
     }
     if (ps_consts_dirty_ || f.ps_uni == UINT32_MAX || f.ps_uni_shader != ps) {
-      const uint32_t off = f.data.Alloc(4096, DK_UNIFORM_BUF_ALIGNMENT);
-      if (off == UINT32_MAX) return RingFull(f, "uniforms", 4096, vs->ucode_data_hash());
+      const uint32_t off = f.data.Alloc(UniformBytes(ps), DK_UNIFORM_BUF_ALIGNMENT);
+      if (off == UINT32_MAX || off + 4096 > f.data.size) return RingFull(f, "uniforms", 4096, vs->ucode_data_hash());
       CopyConstantSpan(f.data.cpu + off, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X], ps);
       f.ps_uni = off;
       f.ps_uni_shader = ps;
@@ -2972,6 +3085,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
   DkQueue queue_ = nullptr;
   DkSwapchain swapchain_ = nullptr;
   MemBlock code_, images_, descriptors_, cmdmem_;
+  MemBlock stream_cache_;                           // FindCopy: vertex and index bytes that outlive a frame
+  std::unordered_map<uint64_t, GuestCopy> copies_;  // FindCopy: guest address, size and kind -> the copy
+  size_t copies_prune_at_ = 8192;
+  uint32_t frame_serial_ = 0;  // a new value at every start of the frame data ring (BeginFrame, FlushFrameData)
+  bool cache_full_ = false;    // the stream cache had no room: BeginFrame empties it
+  uint32_t cache_resets_ = 0, ring_flushes_ = 0, mem_log_windows_ = 0;
   uint32_t sampler_desc_offset_ = 0;
   Frame frames_[kFrames];
   uint32_t frame_ = 0;
@@ -3088,7 +3207,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
   double t_gpu_ms_ = 0;  // GPU time between the frame's timestamps
   uint32_t gpu_frames_ = 0;
   uint32_t uni_uploads_[3] = {};  // BindUniforms copies per second: vs, ps, sys
-  uint32_t vtx_copied_bytes_ = 0, vtx_reused_bytes_ = 0;  // CopyStream per second: copied into the ring, served by an earlier copy
+  // FindCopy per second: bytes copied into the frame ring, copied into the stream cache, served by an earlier copy
+  uint32_t vtx_copied_bytes_ = 0, vtx_cached_bytes_ = 0, vtx_reused_bytes_ = 0;
   uint32_t data_peak_ = 0;  // the fullest frame data ring of the second, bytes
   uint32_t texbind_hits_ = 0;  // texture bindings served by the frame's cache
   bool vs_consts_dirty_ = true, ps_consts_dirty_ = true;  // WriteRegister
