@@ -110,8 +110,11 @@ nx_generate_nacp(tmnt.nacp NAME "TMNT Re-Shelled" AUTHOR "tmnt-recomp" VERSION "
 # The hbmenu icon: the logo and title thumbnail from the player's own game files (tools/game_icon.py, switch/build.sh).
 # Game art: it stays outside git and lives only inside the NRO; without it the devkitPro default icon.
 set(TMNT_ICON "" CACHE FILEPATH "256x256 JPEG NRO icon (outside git)")
+# The renderer's shaders ride inside the NRO (romfs:/shaders/): switch/build.sh fills the folder before it configures
+# and removes the old NRO before every build, so the NRO always carries this build's shaders.
+set(TMNT_ROMFS "${CMAKE_BINARY_DIR}/romfs")
 if(TMNT_ICON AND EXISTS "${TMNT_ICON}")
-    nx_create_nro(tmnt NACP tmnt.nacp ICON "${TMNT_ICON}")
+    nx_create_nro(tmnt NACP tmnt.nacp ICON "${TMNT_ICON}" ROMFS "${TMNT_ROMFS}")
 else()
-    nx_create_nro(tmnt NACP tmnt.nacp)
+    nx_create_nro(tmnt NACP tmnt.nacp ROMFS "${TMNT_ROMFS}")
 endif()

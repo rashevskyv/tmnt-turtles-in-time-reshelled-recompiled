@@ -558,6 +558,14 @@ class Deko3dCommandProcessor : public CommandProcessor {
     dump_images_ = access((debug_dir + "dk_dump").c_str(), F_OK) == 0;  // readback dumps stall the GPU: debug only
     debug_dir_ = debug_dir;
     gpu_checkpoints_ = access((debug_dir + "dk_gpu_checkpoints").c_str(), F_OK) == 0;
+    missing_dir_ = shader_dir_ + "missing/";
+#ifndef TMNT_DK_GL
+    // The shaders ship inside the NRO (romfs:/shaders/, switch/build.sh), so a build can not meet another build's
+    // shaders. Console 0.84 ran with the card's 0.78 folder: the instancing vertex shaders had no index offset
+    // and the floor under the turtle was not drawn. The card folder is the fallback for an NRO without them.
+    if (R_SUCCEEDED(romfsInit()) && access("romfs:/shaders/present.vert.dksh", F_OK) == 0) shader_dir_ = "romfs:/shaders/";
+    else Log("no shaders inside the NRO: the card folder %s is used and must be this build's", shader_dir_.c_str());
+#endif
 #ifdef TMNT_DEKO3D_DEBUG_LIB
     Log("deko3d debug library (deko3dd): errors are reported through the debug callback before the abort");
 #endif
@@ -633,9 +641,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     if (!shader->loaded) {
       missing_shaders_++;
-      Log("no DKSH for %s %016llX (%u dwords at %08X): dumping the ucode to %smissing/",
+      Log("no DKSH for %s %016llX (%u dwords at %08X): dumping the ucode to %s",
           shader_type == xenos::ShaderType::kVertex ? "VS" : "PS", (unsigned long long)hash, dword_count, guest_address,
-          shader_dir_.c_str());
+          missing_dir_.c_str());
       DumpMissing(*shader);
     } else {
       REXLOG_INFO("[dk] shader {} {:016X} loaded ({} dwords)", shader_type == xenos::ShaderType::kVertex ? "VS" : "PS",
@@ -1427,7 +1435,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (elapsed >= 1.0) {
       // Frames drawn per second, then the main thread's busy ms per guest frame (switch_nx.cpp's busy line; the
       // game makes 60 guest frames a second, so above 16.7 it runs slow): "30 FPS  CPU 18.7 MS".
-      std::snprintf(hud_text_, sizeof(hud_text_), "%.0f FPS  CPU %.1f MS", hud_window_swaps_ / elapsed, rex_nx_main_busy_ms);
+      // DIAG: the dk_gpu_checkpoints file is on the card (a barrier after every draw; console 0.84 ran at 7 frames a second with it).
+      std::snprintf(hud_text_, sizeof(hud_text_), "%.0f FPS  CPU %.1f MS%s", hud_window_swaps_ / elapsed, rex_nx_main_busy_ms,
+                    gpu_checkpoints_ ? "  DIAG" : "");
       std::sort(shown_ms_.begin(), shown_ms_.end());
       const size_t sn = shown_ms_.size();
       const size_t le34 = std::upper_bound(shown_ms_.begin(), shown_ms_.end(), 34.0) - shown_ms_.begin();
@@ -3018,7 +3028,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   // shader_<hash>.ucode.<ext>, the translator's input), written with stdio: the SDK's version goes
   // through std::filesystem::absolute, which turns sdmc:/x into /sdmc:/x on newlib (finding 0.41).
   void DumpMissing(const DkShaderObj& shader) {
-    std::string dir = shader_dir_ + "missing/";
+    const std::string& dir = missing_dir_;  // on the card: the NRO's romfs is read-only
     mkdir(dir.c_str(), 0777);
     const char* ext = shader.type() == xenos::ShaderType::kVertex ? "vert" : "frag";
     char name[512];
@@ -3198,6 +3208,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   std::string debug_dir_;
   std::vector<std::string> trace_lines_;
   std::string shader_dir_;
+  std::string missing_dir_;  // ucode dumps of shaders without a DKSH (always on the card)
   std::vector<uint32_t> page_serial_ = std::vector<uint32_t>(0x20000);  // per 4 KB physical page: the draw serial of its last write
   std::vector<uint8_t> page_seen_ = std::vector<uint8_t>(0x20000);  // in frame_pages_ already
   std::vector<uint32_t> frame_pages_, last_frame_pages_;            // pages seen dirty in this / the previous frame

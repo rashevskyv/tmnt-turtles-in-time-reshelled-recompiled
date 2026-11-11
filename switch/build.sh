@@ -71,6 +71,33 @@ ICON=$ROOT/icon/tmnt_icon_256.jpg
 mkdir -p "$ROOT/icon"
 python3 "$SRC/tools/game_icon.py" "$SRC/game/extracted" "$ICON" || rm -f "$ICON"
 
+# deko3d renderer shaders (shared with cvhd-recomp): the present shaders and the game's shaders as DKSH. They go
+# into the NRO (romfs:/shaders/, nx_create_nro ROMFS in switch/switch.cmake), so the NRO is the whole deploy and
+# can not run with another build's shaders (console 0.84 ran with the card's 0.78 folder). The game's shaders come
+# from the trace backend's --dump_shaders directory ($TMNT_SHADER_DUMPS) through tools/xenos2glsl.py + uam.
+ROMFS=$BUILD/romfs
+rm -rf "$ROMFS"
+mkdir -p "$ROMFS/shaders"
+for s in vert frag; do
+    uam -s $s -o "$ROMFS/shaders/present.$s.dksh" "$SRC/src/gpu/shaders/present.$s"
+done
+uam -s frag -o "$ROMFS/shaders/depthcopy.frag.dksh" "$SRC/src/gpu/shaders/depthcopy.frag"
+uam -s frag -o "$ROMFS/shaders/depthrestore.frag.dksh" "$SRC/src/gpu/shaders/depthrestore.frag"
+SHADER_DUMPS=${TMNT_SHADER_DUMPS:-$ROOT/shaders_trace}
+if [ -d "$SHADER_DUMPS" ]; then
+    rm -rf "$BUILD/glsl"
+    python3 "$SRC/tools/xenos2glsl.py" --all "$SHADER_DUMPS" --out-dir "$BUILD/glsl" --check | tail -1
+    for f in "$BUILD"/glsl/*.glsl.dksh; do
+        [ -f "$f" ] || continue
+        cp "$f" "$ROMFS/shaders/$(basename "$f" .glsl.dksh).dksh"
+    done
+    # Markers of the vertex shaders whose streams are storage buffers (computed fetch indices). One line each:
+    # an empty file inside a romfs is not relied on.
+    for f in "$BUILD"/glsl/*.vert.ssbo; do
+        [ -f "$f" ] && echo ssbo > "$ROMFS/shaders/$(basename "$f")"
+    done
+fi
+
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -86,28 +113,12 @@ sha1sum "$BUILD"/tmnt.nro 2>/dev/null || true
 # What hbmenu will show; the NACP version must be this build's.
 python3 "$SRC/tools/nro_nacp.py" "$BUILD/tmnt.nro" "$VERSION"
 
-# deko3d renderer staging (shared with cvhd-recomp): the present shaders and the game's shaders as DKSH next
-# to the NRO in $BUILD/stage/ (switch/deploy.sh copies it to the console). The game's shaders come from the
-# trace backend's --dump_shaders directory ($TMNT_SHADER_DUMPS) through tools/xenos2glsl.py + uam.
+# Staging next to the NRO in $BUILD/stage/: the card folder sdmc:/switch/tmnt/shaders/ is only the fallback of an
+# NRO without shaders; the copy keeps that folder current.
 STAGE=$BUILD/stage
 rm -rf "$STAGE"
-mkdir -p "$STAGE/shaders"
-for s in vert frag; do
-    uam -s $s -o "$STAGE/shaders/present.$s.dksh" "$SRC/src/gpu/shaders/present.$s"
-done
-uam -s frag -o "$STAGE/shaders/depthcopy.frag.dksh" "$SRC/src/gpu/shaders/depthcopy.frag"
-uam -s frag -o "$STAGE/shaders/depthrestore.frag.dksh" "$SRC/src/gpu/shaders/depthrestore.frag"
-SHADER_DUMPS=${TMNT_SHADER_DUMPS:-$ROOT/shaders_trace}
-if [ -d "$SHADER_DUMPS" ]; then
-    rm -rf "$BUILD/glsl"
-    python3 "$SRC/tools/xenos2glsl.py" --all "$SHADER_DUMPS" --out-dir "$BUILD/glsl" --check | tail -1
-    for f in "$BUILD"/glsl/*.glsl.dksh; do
-        [ -f "$f" ] || continue
-        cp "$f" "$STAGE/shaders/$(basename "$f" .glsl.dksh).dksh"
-    done
-    # Markers of the vertex shaders whose streams are storage buffers (computed fetch indices).
-    cp "$BUILD"/glsl/*.vert.ssbo "$STAGE/shaders/" 2>/dev/null || true
-fi
+mkdir -p "$STAGE"
+cp -r "$ROMFS/shaders" "$STAGE/shaders"
 cp "$BUILD/tmnt.nro" "$STAGE/tmnt.nro"
 touch "$STAGE/deko3d"
 echo "stage: $STAGE ($(ls "$STAGE/shaders" | wc -l) shaders)"
