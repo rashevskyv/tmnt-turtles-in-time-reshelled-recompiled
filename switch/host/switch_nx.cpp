@@ -206,6 +206,20 @@ extern "C" Result __wrap_nvGpuChannelKickoff(NvGpuChannel* c) {
     const bool channel_error = R_SUCCEEDED(nvGpuChannelGetErrorNotification(c, &notif)) && notif.status;
     std::printf("[nx] gpu: kickoff of %u gpfifo entries failed, rc 0x%X (module %u, description %u), channel error %d\n",
                 entries, rc, R_MODULE(rc), R_DESCRIPTION(rc), int(channel_error));
+    if (channel_error) {
+        // Console 0.85 died at the second level frame with "channel error 1" and nothing more: the notification reads
+        // once (deko3d's own read right after this one found no error and printed no detail), so its words and the
+        // kernel's error record are printed here, raw. info32: 8 idle timeout, 13 GR software notify, 24 semaphore
+        // timeout, 25 GR illegal notify, 31 MMU fault, 32 PBDMA error. Record type as deko3d reads it: 1 page fault
+        // (word 1:2 = the GPU address, word 3 = 2 for a write), 2 method error ([word 4 : (word 1 & 0xFFFF) / 4] =
+        // word 3), 3 rejected command list, 4 timeout. The block addresses are in the "[dk] gpu memory" line.
+        NvError e{};
+        const Result erc = nvGpuChannelGetErrorInfo(c, &e);
+        std::printf("[nx] gpu: channel error notification: timestamp %llu info32 %u info16 %u status 0x%X\n",
+                    (unsigned long long)notif.timestamp, notif.info32, unsigned(notif.info16), unsigned(notif.status));
+        std::printf("[nx] gpu: channel error record: rc 0x%X type %u words %08X %08X %08X %08X %08X %08X %08X %08X\n", erc, e.type,
+                    e.info[0], e.info[1], e.info[2], e.info[3], e.info[4], e.info[5], e.info[6], e.info[7]);
+    }
     int tries = 0;
     for (; !channel_error && R_FAILED(rc) && tries < 400; tries++) {
         svcSleepThread(5'000'000);

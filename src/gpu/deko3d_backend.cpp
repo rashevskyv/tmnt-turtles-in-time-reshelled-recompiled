@@ -570,15 +570,21 @@ class Deko3dCommandProcessor : public CommandProcessor {
     Log("deko3d debug library (deko3dd): errors are reported through the debug callback before the abort");
 #endif
     g_dk_fault_dump = [this](const char* why) { DumpFencedFrames(why); };
-    if (gpu_checkpoints_) {
-      Log("GPU checkpoints enabled; dk_skip is ignored");
-      for (Frame& f : frames_) {
-        if (!f.checkpoint_data.Create(device_, kMaxCheckpoints * 16, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuUncached)) {
-          Log("GPU checkpoint buffer allocation failed");
-          return false;
-        }
+    if (gpu_checkpoints_) Log("GPU checkpoints enabled; dk_skip is ignored");
+    for (Frame& f : frames_) {  // the report storage of the checkpoints and of the trail (Checkpoint)
+      if (!f.checkpoint_data.Create(device_, kMaxCheckpoints * 16, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuUncached)) {
+        Log("GPU checkpoint buffer allocation failed");
+        return false;
       }
     }
+    // A GPU page fault names an address (the "[nx] gpu: channel error record" line): these are the blocks it can be in.
+    Log("gpu memory: code %llX+%X images %llX+%X descriptors %llX+%X stream cache %llX+%X commands %llX+%X",
+        (unsigned long long)code_.gpu, code_.size, (unsigned long long)images_.gpu, images_.size, (unsigned long long)descriptors_.gpu,
+        descriptors_.size, (unsigned long long)stream_cache_.gpu, stream_cache_.size, (unsigned long long)cmdmem_.gpu, cmdmem_.size);
+    for (uint32_t i = 0; i < kFrames; i++)
+      Log("gpu memory: frame %u data %llX+%X staging %llX+%X reports %llX+%X", i, (unsigned long long)frames_[i].data.gpu, frames_[i].data.size,
+          (unsigned long long)frames_[i].staging.gpu, frames_[i].staging.size, (unsigned long long)frames_[i].checkpoint_data.gpu,
+          frames_[i].checkpoint_data.size);
     if (FILE* sf = gpu_checkpoints_ ? nullptr : std::fopen((debug_dir + "dk_skip").c_str(), "r")) {
       unsigned long long v, p;
       while (std::fscanf(sf, "%llx %llx", &v, &p) == 2) skip_pairs_.insert(PairKey({v, p}));
@@ -1437,7 +1443,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       // game makes 60 guest frames a second, so above 16.7 it runs slow): "30 FPS  CPU 18.7 MS".
       // DIAG: the dk_gpu_checkpoints file is on the card (a barrier after every draw; console 0.84 ran at 7 frames a second with it).
       std::snprintf(hud_text_, sizeof(hud_text_), "%.0f FPS  CPU %.1f MS%s", hud_window_swaps_ / elapsed, rex_nx_main_busy_ms,
-                    gpu_checkpoints_ ? "  DIAG" : "");
+                    gpu_checkpoints_ ? "  DIAG" : trail_ ? "  TRAIL" : "");  // TRAIL: a report per draw, the fps is a little low
       std::sort(shown_ms_.begin(), shown_ms_.end());
       const size_t sn = shown_ms_.size();
       const size_t le34 = std::upper_bound(shown_ms_.begin(), shown_ms_.end(), 34.0) - shown_ms_.begin();
@@ -1529,6 +1535,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   void NoteFaultedFrame(const Frame& f) {
     LogHungFrame(f);
     if (gpu_checkpoints_) { ReportCheckpoints(f); return; }
+    if (trail_) ReportCheckpoints(f);
     int n = 0;
     if (FILE* o = std::fopen((debug_dir_ + "dk_skip").c_str(), "a")) {
       for (const auto& d : f.draw_log) {
@@ -1553,7 +1560,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       skip_frame_ = true;
       if (++busy_run_ == 120) {
         LogHungFrame(frames_[frame_]);
-        if (gpu_checkpoints_) {
+        if (gpu_checkpoints_ || trail_) {
           // Save the live snapshot before a driver error check can abort the process.
           ReportCheckpoints(frames_[frame_], true);
           const DkResult result = dkFenceWait(&frames_[frame_].fence, 10000000ll);
@@ -1610,7 +1617,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   // ----- frames ---------------------------------------------------------------------------------
   static constexpr uint32_t kMaxCheckpoints = 4096;
   void Checkpoint(Frame& f, const char* fmt, ...) {
-    if (!gpu_checkpoints_ || !f.checkpoint_data.block) return;
+    if (!(gpu_checkpoints_ || trail_) || !f.checkpoint_data.block) return;
     if (f.checkpoints.size() == kMaxCheckpoints) { f.checkpoints_full = true; return; }
     char line[384];
     va_list ap;
@@ -1620,7 +1627,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
     uint32_t index = uint32_t(f.checkpoints.size());
     f.checkpoints.emplace_back(line);
     // A full barrier precedes the graphics report; fault timing can still make the boundary ambiguous.
-    dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, 0);
+    // The trail (no dk_gpu_checkpoints file) writes the report without the barrier: console 0.85 lost the GPU channel in
+    // the first level frame and its log could not say at which draw. Every level frame that ran on a console before
+    // had the barriers (0.84), so the trail must not add them.
+    if (gpu_checkpoints_) dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, 0);
     dkCmdBufReportCounter(f.cmdbuf, DkCounter_Timestamp, f.checkpoint_data.gpu + index * 16);
   }
   // Every frame in flight, one file each (dk_gpu_fault_<frame>.txt): called from the deko3d error callback and
@@ -1643,13 +1653,24 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (pending) std::fprintf(out, "Live snapshot after 120 busy skips; the GPU may still be running. Reports may change while read.\n");
     std::fprintf(out, "frame %u, swap %u: %zu checkpoints%s\n", uint32_t(&f - frames_), f.checkpoint_swap, f.checkpoints.size(),
                  f.checkpoints_full ? " (limit reached)" : "");
-    std::fprintf(out, "Reports follow full barriers; missing reports bracket incomplete work, not necessarily the exact fault.\n");
+    std::fputs(gpu_checkpoints_ ? "Reports follow full barriers; missing reports bracket incomplete work, not necessarily the exact fault.\n"
+                                : "Trail: reports without barriers. The GPU can be a few draws past the last report.\n", out);
     size_t first_missing = 0;
     while (first_missing < f.checkpoints.size()) {
       const uint64_t* report = reinterpret_cast<const uint64_t*>(f.checkpoint_data.cpu + first_missing * 16);
       if (!report[0] && !report[1]) break;
       first_missing++;
     }
+    // The same in the log, with the frame's own timestamps: bottom 0/0 = the GPU did not reach the frame's end.
+    const uint64_t none[4] = {};
+    const uint64_t* ts = f.ts_off != UINT32_MAX ? reinterpret_cast<const uint64_t*>(f.data.cpu + f.ts_off) : none;
+    Log("GPU frame %u, swap %u: %zu of %zu reports done in a row, timestamps top %llu/%llu bottom %llu/%llu", uint32_t(&f - frames_),
+        f.checkpoint_swap, first_missing, f.checkpoints.size(), (unsigned long long)ts[0], (unsigned long long)ts[1],
+        (unsigned long long)ts[2], (unsigned long long)ts[3]);
+    if (first_missing) Log("  last done: %zu %s", first_missing - 1, f.checkpoints[first_missing - 1].c_str());
+    if (first_missing < f.checkpoints.size()) Log("  first missing: %zu %s", first_missing, f.checkpoints[first_missing].c_str());
+    std::fprintf(out, "timestamps top %llu/%llu bottom %llu/%llu\n", (unsigned long long)ts[0], (unsigned long long)ts[1],
+                 (unsigned long long)ts[2], (unsigned long long)ts[3]);
     if (first_missing) std::fprintf(out, "last consecutive completed: %zu %s\n", first_missing - 1, f.checkpoints[first_missing - 1].c_str());
     else std::fprintf(out, "last consecutive completed: none\n");
     if (first_missing < f.checkpoints.size()) std::fprintf(out, "first missing: %zu %s\n", first_missing, f.checkpoints[first_missing].c_str());
@@ -1690,6 +1711,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
       }
       if (swaps_ < 6) Log("frame %u: fence done", frame_);
       f.fenced = false;
+    }
+    // ponytail: the trail costs one formatted line and one GPU report per draw, so it ends after 300 finished frames of
+    // 100+ draws (about 10 s of a level). A later fault needs the dk_gpu_checkpoints file.
+    if (trail_ && f.draw_log.size() >= 100 && ++trail_frames_ == 300) {
+      trail_ = false;
+      Log("GPU trail off: 300 frames of 100+ draws finished");
     }
     f.draw_log.clear();
     f.checkpoints.clear();
@@ -1737,7 +1764,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       std::memset(f.data.cpu + f.ts_off, 0, 32);
       dkCmdBufReportCounter(f.cmdbuf, DkCounter_TimestampPipelineTop, f.data.gpu + f.ts_off);
     }
-    if (gpu_checkpoints_) std::memset(f.checkpoint_data.cpu, 0, kMaxCheckpoints * 16);
+    if (gpu_checkpoints_ || trail_) std::memset(f.checkpoint_data.cpu, 0, kMaxCheckpoints * 16);
     dkCmdBufBindImageDescriptorSet(f.cmdbuf, descriptors_.gpu + f.desc_offset, kMaxImageDescriptors);
     dkCmdBufBindSamplerDescriptorSet(f.cmdbuf, descriptors_.gpu + sampler_desc_offset_, kSamplerCount);
     std::fill(std::begin(bound_colors_), std::end(bound_colors_), nullptr);
@@ -3191,6 +3218,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
   std::vector<double> shown_ms_;
   bool gpu_reported_ = false;
   bool gpu_checkpoints_ = false;  // opt-in: sdmc:/switch/tmnt/dk_gpu_checkpoints
+#ifdef TMNT_DK_GL
+  bool trail_ = false;
+#else
+  bool trail_ = true;  // Checkpoint without the barriers, for the first level frames (BeginFrame ends it)
+#endif
+  uint32_t trail_frames_ = 0;
   bool dump_images_ = false;
   bool trace_enabled_ = false, traced_ = false, trace_any_ = false;  // file dk_trace: one line per draw of the first frame with 440+ draws
   uint32_t trace_min_swap_ = 0;  // seconds after the backend started
