@@ -219,6 +219,12 @@ extern "C" Result __wrap_nvGpuChannelKickoff(NvGpuChannel* c) {
                     (unsigned long long)notif.timestamp, notif.info32, unsigned(notif.info16), unsigned(notif.status));
         std::printf("[nx] gpu: channel error record: rc 0x%X type %u words %08X %08X %08X %08X %08X %08X %08X %08X\n", erc, e.type,
                     e.info[0], e.info[1], e.info[2], e.info[3], e.info[4], e.info[5], e.info[6], e.info[7]);
+        // Console 0.86: words 00000400 00000005 7FFFF000 00000001 = a read of 57FFFF000. Word 0 is printed by deko3d
+        // raw; read as nouveau's gk104 fault-info register it gives reason 0 (no page directory), GPC client 4 (a
+        // texture / data cache unit, not the vertex fetch). That layout is an assumption, nobody measured it here.
+        if (e.type == 1) std::printf("[nx] gpu: page fault: %s of GPU address %X%08X; word 0 by the nouveau gk104 layout (ASSUMED): reason %u, %s client %u\n",
+                                     e.info[3] == 2 ? "write" : "read", e.info[1], e.info[2], e.info[0] & 0xF,
+                                     (e.info[0] & 0x40) ? "hub" : "gpc", (e.info[0] >> 8) & 0x1F);
     }
     int tries = 0;
     for (; !channel_error && R_FAILED(rc) && tries < 400; tries++) {

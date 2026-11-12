@@ -8,9 +8,10 @@ with a clear message so the gap is visible (docs/native-renderer-plan.md, M2).
 Interface of the generated GLSL (the deko3d backend relies on it):
   vertex:   layout(location = a) in vec4 in_a      one per vfetch that reads data (in instruction order); the
             sidecar JSON lists (slot, offset, format, stride, signed, integer) per attribute;
-            or, when a fetch index is computed (not the untouched r0.x), no attributes: every stream is
-            layout(std430, binding = b) readonly buffer { uint w[]; } (b = the SDK's vertex binding index) and
-            an empty shader_<hash>.vert.ssbo marker tells the backend to bind storage buffers;
+            the locations count binding by binding (one binding per fetch constant, in first-use order), as the
+            SDK lists them. When a fetch index is computed (not the untouched r0.x) the shader is an instancing
+            shader: its streams are still attributes, and shader_<hash>.vert.inst ("<bias constant> <component>
+            <fetch constant>...") names the per-instance streams; the backend resolves the instance per draw;
             binding 0 = uniform Consts { vec4 c[256]; } (the ALU constants c0..c255);
             binding 1 = uniform Sys (ndc_scale, ndc_offset, alpha test + VGT_INDX_OFFSET in alpha.w, bool constants);
             layout(location = k) out vec4 o_k      the interpolators the shader exports.
@@ -43,17 +44,20 @@ REPLICATED = {'dp4', 'dp3', 'dp2add', 'max4', 'setp_eq_push', 'setp_ne_push', 's
 
 
 class Translator:
-    def __init__(self, text, stage, name, ssbo=False):
+    def __init__(self, text, stage, name, instanced=False):
         self.stage = stage  # 'vert' or 'frag'
         self.name = name
         # Indexed vertex fetches (the SDK semantic: address = base + floor(index) * stride + offset). A vfetch_full
         # whose index is the untouched r0.x reads record gl_VertexID: a vertex attribute. TMNT's scene shaders
-        # (F7F9306F5415C989, 5EC28769AF7E6764) fetch the mesh by r0.x mod c19.x and the matrices by r0.x / c19.x;
-        # such a shader reads every stream from a storage buffer (binding = the SDK's vertex binding index) instead.
-        self.ssbo = ssbo
-        self.needs_ssbo = False
-        self.ssbo_bindings = {}  # fetch slot -> storage buffer binding (first-use order, as the SDK numbers them)
-        self.ssbo_addr = None    # GLSL variable with the word address of the last vfetch_full
+        # (F7F9306F5415C989, 5EC28769AF7E6764, ...) fetch the mesh by r0.x mod c19.x (a mad) and the matrices by
+        # r0.x / c19.x (a mul). The game draws one instance per draw, so the backend resolves the instance on the
+        # CPU and both streams stay attributes: the mesh stream starts at the instance's first record, the matrix
+        # stream is one record with stride 0. Storage buffers did this until 0.86: on the console the first level
+        # frame died with a GPU page fault in a run of these draws (console-logs4, 2026-11-12).
+        self.instanced = instanced
+        self.computed_index = False
+        self.stream_class = {}   # instanced: fetch slot -> 'vertex' (index mod N) or 'instance' (index / N)
+        self.last_op = {}        # (register, component) -> the op that wrote it last
         self.lines = text.splitlines()
         self.body = []        # GLSL statements of the current block
         self.blocks = []      # (cf_index, kind, statements, extra) in order
@@ -90,6 +94,12 @@ class Translator:
     def reg_write(self, idx, comps):
         self.note_reg(idx)
         self.written.setdefault(idx, set()).update(comps)
+
+    def note_op(self, target, comps, op):
+        if re.match(r'^r\d+$', target):
+            for i, ch in enumerate(comps):
+                if ch is not None:
+                    self.last_op[(int(target[1:]), 'xyzw'[i])] = op
 
     def parse_result(self, tok):
         """'r0.__z_' -> (target, [per-component source char or None]). Target: 'r3', 'o1', 'oPos', 'oC0'."""
@@ -179,11 +189,14 @@ class Translator:
         index = None
         if op == 'vfetch_full':
             # The index register: the untouched r0.x is the vertex id (the host supplies the attribute), anything
-            # else is a computed index and needs the storage buffer path.
+            # else is a computed index: an instancing shader.
             if parts[1] != 'r0.x' or 'x' in self.written.get(0, set()):
-                self.needs_ssbo = True
-            index = self.parse_source(parts[1], 1)
+                self.computed_index = True
+            self.parse_source(parts[1], 1)
+            m = re.match(r'^r(\d+)\.([xyzw])$', parts[1])
+            index_op = self.last_op.get((int(m.group(1)), m.group(2))) if m else None
         target, comps = self.parse_result(parts[0])
+        self.note_op(target, comps, op)
         if op == 'vfetch_full':
             if not parts[2].startswith('vf'):
                 self.err('vfetch_full without a fetch constant', rest)
@@ -198,24 +211,18 @@ class Translator:
         if op == 'vfetch_full':
             self.cur_slot = slot
             self.stride_words = int(kv.get('Stride', '0'))
-            if self.ssbo:
-                # floor() as the SDK converts the float index (no shader here uses RoundIndex); a negative index
-                # wraps to a huge word address and reads as zero through the bounds check. Set even for a
-                # constants-only fetch: the vfetch_mini after it adds its offset to this address.
-                self.ssbo_bindings.setdefault(slot, len(self.ssbo_bindings))
-                self.ssbo_addr = 'vfa_%d' % self.tmp_counter()
-                self.body.append('uint %s = uint(int(floor(%s))) * %du;' % (self.ssbo_addr, index, self.stride_words))
+            if self.instanced:
+                # The index is `mad(-trunc(q), N, x)` (the vertex inside the mesh) or `mul(x + bias, 1 / N)` = q (the
+                # instance). Anything else is a formula the backend does not resolve: stop, do not ship it.
+                cls = {'mad': 'vertex', 'mul': 'instance'}.get(index_op)
+                if cls is None or self.stream_class.setdefault(slot, cls) != cls:
+                    self.err('instancing fetch index written by %r: not index mod N (mad) or index / N (mul), '
+                             'or the stream has both' % index_op, rest)
         if all(ch in (None, '0', '1') for ch in comps):
             # Only constants (vfetch_full r1.0001): the SDK lists no attribute for it, so none here either, or
             # every later in_a would sit one location after the data the backend binds (TMNT 0.48: the
             # sprites took their uv as position and the title screen stayed black).
             self.body.extend(self.write_masked(target, comps, 'vec4(0.0)', False))
-            return
-        if self.ssbo:
-            binding = self.ssbo_bindings[self.cur_slot]
-            value = self.ssbo_load(binding, '%s + %du' % (self.ssbo_addr, int(kv.get('Offset', '0'))),
-                                   kv.get('DataFormat', ''), kv.get('Signed') == 'true', kv.get('NumFormat') == 'integer')
-            self.body.extend(self.write_masked(target, comps, value, False))
             return
         attr = {
             'index': len(self.attrs),
@@ -230,32 +237,6 @@ class Translator:
         self.attrs.append(attr)
         var = 'in_%d' % attr['index']
         self.body.extend(self.write_masked(target, comps, var, False))
-
-    def ssbo_load(self, binding, addr, fmt, signed, integer):
-        """vec4 expression reading one vertex record field from storage buffer `binding` at word `addr`; missing
-        components read 0, w reads 1 (as a vertex attribute does). The words are host order (CopySwapBlock)."""
-        w = lambda i: 'vf%d_w(%s + %du)' % (binding, addr, i)
-        f = lambda i: 'uintBitsToFloat(%s)' % w(i)
-        if fmt == 'FMT_32_FLOAT':
-            return 'vec4(%s, 0.0, 0.0, 1.0)' % f(0)
-        if fmt == 'FMT_32_32_FLOAT':
-            return 'vec4(%s, %s, 0.0, 1.0)' % (f(0), f(1))
-        if fmt == 'FMT_32_32_32_FLOAT':
-            return 'vec4(%s, %s, %s, 1.0)' % (f(0), f(1), f(2))
-        if fmt == 'FMT_32_32_32_32_FLOAT':
-            return 'vec4(%s, %s, %s, %s)' % (f(0), f(1), f(2), f(3))
-        if fmt == 'FMT_16_16_FLOAT':
-            return 'vec4(unpackHalf2x16(%s), 0.0, 1.0)' % w(0)
-        if fmt == 'FMT_16_16_16_16_FLOAT':
-            return 'vec4(unpackHalf2x16(%s), unpackHalf2x16(%s))' % (w(0), w(1))
-        if fmt == 'FMT_8_8_8_8':
-            # The same decode as the attribute path (VertexAttribOf): integer -> scaled, else normalized.
-            if integer and signed:
-                return 'vec4(ivec4(int(%s << 24) >> 24, int(%s << 16) >> 24, int(%s << 8) >> 24, int(%s) >> 24))' % (w(0), w(0), w(0), w(0))
-            if integer:
-                return 'vec4(uvec4(%s & 255u, (%s >> 8) & 255u, (%s >> 16) & 255u, %s >> 24))' % (w(0), w(0), w(0), w(0))
-            return '%s(%s)' % ('unpackSnorm4x8' if signed else 'unpackUnorm4x8', w(0))
-        self.err('indexed vertex fetch of %s is not supported' % fmt)
 
     def emit_fetch_texture(self, op, rest):
         # tfetch2D r0, r0.xy, tf0[, FetchValidOnly=false, ...]
@@ -421,6 +402,7 @@ class Translator:
             op, sat, res, ops = vec
             a = [self.parse_source(o, 4) for o in ops]  # sources before the result (read-before-write analysis)
             target, comps = self.parse_result(res)
+            self.note_op(target, comps, op)
             expr = self.vector_expr(op, a)
             if sat:
                 expr = 'clamp(%s, 0.0, 1.0)' % expr
@@ -437,6 +419,7 @@ class Translator:
             else:
                 a = []
             target, comps = self.parse_result(res)
+            self.note_op(target, comps, op)
             expr = self.scalar_expr(op, a)
             if sat:
                 expr = 'clamp(%s, 0.0, 1.0)' % expr
@@ -626,12 +609,14 @@ class Translator:
             # The same position in a depth pre-pass and in a colour pass (two shaders) must match bit for bit
             # (hcu-switch: otherwise a LEQUAL test fails, missing meshes and z-fighting).
             out.append('invariant gl_Position;')
+            # The SDK makes one vertex binding per fetch constant (first-use order) and the backend numbers the
+            # attributes binding by binding. An instancing shader fetches its mesh stream twice, around the others.
+            slots = list(dict.fromkeys(a['slot'] for a in self.attrs))
+            for loc, a in enumerate(sorted(self.attrs, key=lambda a: slots.index(a['slot']))):
+                a['location'] = loc
             for a in self.attrs:
                 out.append('layout(location = %d) in vec4 in_%d;  // vf%d offset %d %s' % (
-                    a['index'], a['index'], a['slot'], a['offset_words'], a['format']))
-            for slot, b in sorted(self.ssbo_bindings.items(), key=lambda kv: kv[1]):
-                out.append('layout(std430, binding = %d) readonly buffer Vf%d { uint w[]; } vf%d;  // vf%d' % (b, b, b, slot))
-                out.append('uint vf%d_w(uint a) { return a < uint(vf%d.w.length()) ? vf%d.w[a] : 0u; }' % (b, b, b))
+                    a['location'], a['index'], a['slot'], a['offset_words'], a['format']))
         else:
             for k in sorted(self.reads_before_write):
                 out.append('layout(location = %d) in vec4 i_%d;' % (k, k))
@@ -669,9 +654,10 @@ class Translator:
         for i in range(self.max_reg + 1):
             if self.stage == 'frag' and i in self.reads_before_write:
                 out.append(ind + 'vec4 r%d = i_%d;' % (i, i))
-            elif self.stage == 'vert' and i == 0 and self.ssbo:
+            elif self.stage == 'vert' and i == 0 and self.instanced:
                 # Sys alpha.w = VGT_INDX_OFFSET: the backend draws these shaders without a base vertex, so
                 # gl_VertexID is the index itself on every host (GL adds the base vertex to it, NVN may not).
+                # No fetch reads it any more; what else reads it (a sign test of r0.x) keeps the guest's value.
                 out.append(ind + 'vec4 r0 = vec4(float(gl_VertexID) + alpha.w, 0.0, 0.0, 0.0);  // the vertex index')
             else:
                 out.append(ind + 'vec4 r%d = vec4(0.0);' % i)
@@ -777,7 +763,8 @@ class Translator:
             'textures': {str(k): v for k, v in sorted(self.textures.items())},
             'interpolators': interps, 'inputs': sorted(self.reads_before_write) if self.stage == 'frag' else [],
             'colors': colors, 'has_jump': self.has_jump, 'uses_bools': self.uses_bools, 'kill': self.has_kill,
-            'ssbo': self.ssbo,
+            'instanced': self.instanced,
+            'instance_slots': sorted(s for s, c in self.stream_class.items() if c == 'instance'),
         }
         return '\n'.join(out) + '\n', meta
 
@@ -816,13 +803,16 @@ def translate_file(path):
     text = open(path, encoding='utf-8').read()
     t = Translator(text, stage, name)
     glsl, meta = t.translate()
-    if t.needs_ssbo:
-        # A computed fetch index somewhere: every stream of this shader goes through storage buffers.
-        glsl, meta = Translator(text, stage, name, ssbo=True).translate()
-        # The backend bounds such a shader's streams by the game's instancing divisor, trunc(c19.x)
-        # (deko3d_backend.cpp, stream_vertices): a shader with another index formula must not ship silently.
-        if 'trunc(c[19].x' not in glsl:
-            raise SystemExit('%s: storage-buffer shader without the c19.x instancing divisor' % name)
+    if t.computed_index:
+        # A computed fetch index somewhere: an instancing shader (Translator.__init__).
+        glsl, meta = Translator(text, stage, name, instanced=True).translate()
+        # The backend resolves the instance as floor((index + bias) / trunc(c19.x)) (deko3d_backend.cpp,
+        # tmnt::ResolveInstance): a shader with another index formula must not ship silently.
+        bias = set(re.findall(r'\(r0\.xxxx \+ c\[(\d+)\]\.([xyzw])\2\2\2\)', glsl))
+        if 'trunc(c[19].x' not in glsl or len(bias) != 1 or not meta['instance_slots']:
+            raise SystemExit('%s: instancing shader without the c19.x divisor, one index bias or an instance stream' % name)
+        const, comp = bias.pop()
+        meta['instance_bias'] = [int(const), 'xyzw'.index(comp)]
     return glsl, meta
 
 
@@ -859,9 +849,11 @@ def main():
             dst = os.path.join(args.out_dir or args.all, stem + '.glsl')
             open(dst, 'w', newline='\n').write(glsl)
             open(dst.replace('.glsl', '.json'), 'w', newline='\n').write(json.dumps(meta, indent=1))
-            if meta.get('ssbo'):
-                # Marker for the backend (staged next to the DKSH): bind the streams as storage buffers.
-                open(dst.replace('.glsl', '.ssbo'), 'w').close()
+            if meta.get('instanced'):
+                # For the backend (staged next to the DKSH): the bias constant and its component, then the fetch
+                # constants (95 - slot, as the SDK numbers them) of the per-instance streams.
+                open(dst.replace('.glsl', '.inst'), 'w', newline='\n').write('%d %d %s\n' % (
+                    *meta['instance_bias'], ' '.join(str(95 - s) for s in meta['instance_slots'])))
             if args.check:
                 good, msg = uam_check(dst, meta['stage'])
                 print('%s %s%s' % ('OK  ' if good else 'FAIL', stem, '' if good else ': ' + msg))

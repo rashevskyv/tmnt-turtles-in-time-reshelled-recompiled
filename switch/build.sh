@@ -91,10 +91,10 @@ if [ -d "$SHADER_DUMPS" ]; then
         [ -f "$f" ] || continue
         cp "$f" "$ROMFS/shaders/$(basename "$f" .glsl.dksh).dksh"
     done
-    # Markers of the vertex shaders whose streams are storage buffers (computed fetch indices). One line each:
-    # an empty file inside a romfs is not relied on.
-    for f in "$BUILD"/glsl/*.vert.ssbo; do
-        [ -f "$f" ] && echo ssbo > "$ROMFS/shaders/$(basename "$f")"
+    # The instancing vertex shaders (computed fetch indices): the index bias and the per-instance streams, one
+    # line each, for the backend.
+    for f in "$BUILD"/glsl/*.vert.inst; do
+        [ -f "$f" ] && cp "$f" "$ROMFS/shaders/"
     done
 fi
 

@@ -53,6 +53,7 @@
 #include <rex/string/buffer.h>
 #include <rex/system/gpu_plugin.h>
 
+#include "instancing.h"
 #include "ucode_hash.h"
 #include "untile_fast.h"
 
@@ -224,7 +225,11 @@ class DkShaderObj : public Shader {
   bool loaded = false;
   DkShader geom{};           // vertex shaders: the rectangle-list geometry shader
   bool geom_loaded = false;
-  bool ssbo = false;         // vertex shaders: computed fetch indices; the streams are storage buffers (xenos2glsl .ssbo)
+  // Vertex shaders with computed fetch indices: the game's instancing shaders (xenos2glsl .vert.inst, instancing.h).
+  bool instanced = false;
+  uint32_t inst_bias = 0;       // the index bias: float constant register (constant * 4 + component)
+  uint64_t inst_fetch[2] = {};  // bit per fetch constant: a per-instance stream
+  uint32_t inst_logs = 0;       // "instanced draw" lines printed for this shader
   uint32_t uni_bytes = 0;    // the float constants up to the highest one the shader reads, in 256-byte steps (UniformBytes)
 };
 
@@ -641,9 +646,18 @@ class Deko3dCommandProcessor : public CommandProcessor {
       std::snprintf(name, sizeof(name), "%sshader_%016llX.geom.dksh", shader_dir_.c_str(), (unsigned long long)hash);
       shader->geom_loaded = LoadDksh(name, shader->geom);
       if (!shader->geom_loaded) LogOnce("geom", "no rectangle-list geometry shader for VS %016llX (%s)", (unsigned long long)hash, name);
-      std::snprintf(name, sizeof(name), "%sshader_%016llX.vert.ssbo", shader_dir_.c_str(), (unsigned long long)hash);
-      shader->ssbo = access(name, F_OK) == 0;
-      if (shader->ssbo) Log("VS %016llX fetches by computed indices: storage buffers", (unsigned long long)hash);
+      std::snprintf(name, sizeof(name), "%sshader_%016llX.vert.inst", shader_dir_.c_str(), (unsigned long long)hash);
+      if (FILE* fp = std::fopen(name, "r")) {
+        unsigned constant = 0, component = 0, fetch = 0, streams = 0;
+        if (std::fscanf(fp, "%u %u", &constant, &component) == 2 && constant < 256 && component < 4) {
+          while (std::fscanf(fp, "%u", &fetch) == 1 && fetch < 96) { shader->inst_fetch[fetch / 64] |= 1ull << (fetch % 64); streams++; }
+        }
+        std::fclose(fp);
+        shader->instanced = streams != 0;
+        shader->inst_bias = constant * 4 + component;
+        Log("VS %016llX is an instancing shader: bias c%u[%u], %u per-instance stream(s)%s", (unsigned long long)hash, constant,
+            component, streams, streams ? "" : " (BAD .vert.inst FILE)");
+      }
     }
     if (!shader->loaded) {
       missing_shaders_++;
@@ -988,7 +1002,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // Vertex layout and data: one buffer per fetch constant the vertex shader uses.
     DkVtxAttribState attribs[DK_MAX_VERTEX_ATTRIBS];
     DkVtxBufferState buffers[DK_MAX_VERTEX_BUFFERS];
-    uint32_t attrib_count = 0, buffer_count = 0, ssbo_count = 0;
+    uint32_t attrib_count = 0, buffer_count = 0;
     uint32_t vertex_count = index_count;
     uint32_t min_index = 0;  // the lowest vertex index the draw reads
     DkGpuAddr index_gpu = 0;
@@ -1012,22 +1026,29 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // vertex offset is -min_index. A copy from vertex 0 grows with the highest index, whatever the draw reads (Eden
     // 0.78, level 1: the vertex phase grew to 2-4 s a frame, the 24 MB frame ring filled, draws were dropped; the
     // index values themselves were not logged then: the "vertex copy" line below measures them).
-    // A storage-buffer shader computes its record addresses from gl_VertexID + Sys alpha.w (the offset, BindUniforms),
-    // which must be the guest index: its streams still start at vertex 0 and it draws without a vertex offset.
-    const uint32_t first_vertex = vs->ssbo ? 0 : uint32_t(std::max<int64_t>(0, int64_t(min_index) + indx_offset));
-    uint32_t stream_vertices = vs->ssbo ? uint32_t(std::max<int64_t>(0, int64_t(vertex_count) + indx_offset))
-                                        : vertex_count - min_index;
-    if (vs->ssbo) {
-      // The game's four storage-buffer shaders are its instancing shaders. With N = trunc(c19.x), the vertices of
-      // the mesh: instance = floor((index + c255.z) / N) reads the 64-byte instance stream, index - instance * N
-      // reads the mesh stream. So no stream is read past record max(N, max index / N + 1). (max index + 1) records
-      // were N times the instance data: instance k of a 2394-vertex mesh copied (k + 1) * 153 KB (Eden 0.80: the
-      // game draws instance k with VGT_INDX_OFFSET k * N, the frame ring stayed full).
-      // ponytail: c19.x as the divisor is these four shaders' own code (xenos2glsl refuses another storage-buffer
-      // shader); the bound belongs in the .ssbo file if a shader with another index formula appears.
-      const float n = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 19 * 4);
-      if (n >= 1.0f && n < 16777216.0f) stream_vertices = std::min(stream_vertices, std::max(uint32_t(n), stream_vertices / uint32_t(n) + 1));
+    // An instancing shader (instancing.h) fetches mesh record (index + offset) mod N and instance record
+    // (index + offset) / N. The game draws instance k as its own draw with VGT_INDX_OFFSET k * N (Eden 0.80), so the
+    // instance is resolved here: the mesh stream is an attribute stream from the record of index 0 (the draw has no
+    // vertex offset: gl_VertexID + Sys alpha.w stays the guest index for the shader's own arithmetic) and the
+    // instance stream is one record with host stride 0. Storage buffers held these streams until 0.86: the console
+    // died with a GPU page fault (read of 57FFFF000, past every block) in the first level frame, in a run of these
+    // draws, while the same shaders ran in Eden. With a full barrier per draw (0.84) the level ran on the console.
+    // ponytail: c19.x as the divisor is these four shaders' own code (xenos2glsl refuses another formula).
+    uint32_t instance = 0, mesh_first = 0;
+    if (vs->instanced) {
+      const float c19x = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 19 * 4);
+      const float bias = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + vs->inst_bias);
+      const bool resolved = tmnt::ResolveInstance(c19x, bias, indx_offset, min_index, vertex_count - 1, instance, mesh_first);
+      if (vs->inst_logs < (resolved ? 6u : 12u)) {  // per shader: the first draws, and more of the refused ones
+        vs->inst_logs++;
+        Log("instanced draw VS %016llX: N %g bias %g offset %d indices %u-%u: %s instance %u, mesh from record %u",
+            (unsigned long long)vs->ucode_data_hash(), c19x, bias, indx_offset, min_index, vertex_count - 1,
+            resolved ? "one instance," : "NOT ONE INSTANCE, SKIPPED;", instance, mesh_first);
+      }
+      if (!resolved) { inst_skipped_++; skipped_++; return true; }
     }
+    const uint32_t first_vertex = vs->instanced ? mesh_first : uint32_t(std::max<int64_t>(0, int64_t(min_index) + indx_offset));
+    const uint32_t stream_vertices = vs->instanced ? vertex_count : vertex_count - min_index;
     uint32_t copied_bytes = 0;
     for (const auto& vb : vs->vertex_bindings()) {
       if (buffer_count >= DK_MAX_VERTEX_BUFFERS) break;
@@ -1037,9 +1058,18 @@ class Deko3dCommandProcessor : public CommandProcessor {
         LogOnce("vbsize", "vertex data size overflow: %u vertices x %u bytes", stream_vertices, stride);
         skipped_++; return true;
       }
-      uint32_t bytes = stream_vertices * stride;
-      const uint32_t skip = uint32_t(std::min<uint64_t>(uint64_t(first_vertex) * stride, uint64_t(fetch.size) * 4));
+      const bool per_instance = vs->instanced && vb.fetch_constant < 96 &&
+                                (vs->inst_fetch[vb.fetch_constant / 64] >> (vb.fetch_constant % 64) & 1);
+      uint32_t bytes = (per_instance ? 1 : stream_vertices) * stride;
+      const uint32_t skip = uint32_t(std::min<uint64_t>(uint64_t(per_instance ? instance : first_vertex) * stride, uint64_t(fetch.size) * 4));
       uint32_t avail = fetch.size * 4 - skip;
+      if (vs->instanced && stride && bytes > avail) {
+        // The resolved records must exist: a short stream here means the instance or the mesh was resolved wrongly.
+        LogOnce("instshort", "instanced draw VS %016llX skipped: fetch constant %u (%s) holds %u bytes, the draw needs %u from record %u x %u",
+                (unsigned long long)vs->ucode_data_hash(), vb.fetch_constant, per_instance ? "instance" : "mesh", fetch.size * 4,
+                bytes, per_instance ? instance : first_vertex, stride);
+        inst_skipped_++; skipped_++; return true;
+      }
       if (!stride) {
         // A constant stream still needs one record, regardless of the vertex index.
         uint32_t extent_words = 0;
@@ -1079,15 +1109,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
         texture_conversion::CopySwapBlock(fetch.endian, write, memory_->TranslatePhysical((fetch.address << 2) + skip), bytes);
         copied_bytes += bytes;
       }
-      if (vs->ssbo) {
-        // The shader computes its record addresses (floor(index) * stride + offset) and bounds-checks them against
-        // this size; every index it derives from the vertex id is at most the vertex id, so the per-vertex extent
-        // bounds the stream. Binding = the SDK's vertex binding index, the order xenos2glsl numbers the buffers.
-        dkCmdBufBindStorageBuffer(cmd, DkStage_Vertex, ssbo_count++, copy->gpu, bytes);
-        continue;
-      }
       dkCmdBufBindVtxBuffer(cmd, buffer_count, copy->gpu, bytes);
-      buffers[buffer_count] = DkVtxBufferState{stride, 0};
+      buffers[buffer_count] = DkVtxBufferState{per_instance ? 0 : stride, 0};  // stride 0: every vertex reads the one record
       for (const auto& a : vb.attributes) {
         if (attrib_count >= DK_MAX_VERTEX_ATTRIBS) break;
         DkVtxAttribSize size;
@@ -1111,7 +1134,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (copied_bytes > (1u << 20) && big_copy_logs_ < 12) {
       big_copy_logs_++;
       Log("vertex copy %u KB: VS %016llX n=%u indices %u-%u offset %d%s", copied_bytes >> 10, (unsigned long long)vs->ucode_data_hash(),
-          index_count, min_index, vertex_count - 1, indx_offset, vs->ssbo ? " (storage buffers)" : "");
+          index_count, min_index, vertex_count - 1, indx_offset, vs->instanced ? " (instanced)" : "");
     }
     dkCmdBufBindVtxAttribState(cmd, attribs, attrib_count);
     dkCmdBufBindVtxBufferState(cmd, buffers, buffer_count);
@@ -1125,7 +1148,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (index_buffer_info) {
       dkCmdBufBindIdxBuffer(cmd, index_buffer_info->format == xenos::IndexFormat::kInt32 ? DkIdxFormat_Uint32 : DkIdxFormat_Uint16,
                             index_gpu);
-      dkCmdBufDrawIndexed(cmd, prim, index_count, 1, 0, vs->ssbo ? 0 : -int32_t(min_index), 0);
+      dkCmdBufDrawIndexed(cmd, prim, index_count, 1, 0, vs->instanced ? 0 : -int32_t(min_index), 0);
     } else {
       dkCmdBufDraw(cmd, prim, index_count, 1, 0, 0);
     }
@@ -1464,12 +1487,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
 #endif
         std::printf("[nx] dk memory: malloc %zu MB in use of %zu MB arena; images %u MB of %u (%u made, %zu free); shader code %u KB of %u (%zu shaders); "
                     "stream cache %u MB of %u (%zu copies, %u resets); frame data peak %u KB of %u, staging peak %u KB of %u; ring flushes %u; "
-                    "gpfifo entries in one kickoff: max %u of 2048%s\n",
+                    "instanced draws skipped (not resolved to one instance) %u; gpfifo entries in one kickoff: max %u of 2048%s\n",
                     heap_used >> 20, heap_arena >> 20, images_.used >> 20, images_.size >> 20, image_count_, free_images_.size(),
                     code_.used >> 10, code_.size >> 10, shaders_.size(), stream_cache_.used >> 20, stream_cache_.size >> 20, copies_.size(),
                     cache_resets_, std::max(frames_[0].data.peak, frames_[1].data.peak) >> 10, frames_[0].data.size >> 10,
                     std::max(frames_[0].staging.peak, frames_[1].staging.peak) >> 10, frames_[0].staging.size >> 10, ring_flushes_,
-                    unsigned(rex_nx_kick_max), gpu_checkpoints_ ? " (dk_gpu_checkpoints is on)" : "");
+                    inst_skipped_, unsigned(rex_nx_kick_max), gpu_checkpoints_ ? " (dk_gpu_checkpoints is on)" : "");
       }
       shown_ms_.clear();
       texbind_hits_ = late_writes_ = 0;
@@ -2759,7 +2782,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     sys.alpha[0] = cc.alpha_test_enable ? 1.0f : 0.0f;
     sys.alpha[1] = float(uint32_t(cc.alpha_func));
     sys.alpha[2] = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
-    // VGT_INDX_OFFSET for the storage-buffer vertex shaders (xenos2glsl: r0.x = gl_VertexID + alpha.w); signed 24 bits.
+    // VGT_INDX_OFFSET for the instancing vertex shaders (xenos2glsl: r0.x = gl_VertexID + alpha.w); signed 24 bits.
     sys.alpha[3] = float(int32_t(regs.Get<reg::VGT_INDX_OFFSET>().indx_offset << 8) >> 8);
     std::memcpy(sys.bools, &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], sizeof(sys.bools));
     std::memcpy(sys.loops, &regs.values[XE_GPU_REG_SHADER_CONSTANT_LOOP_00], sizeof(sys.loops));
@@ -3232,6 +3255,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   uint32_t frame_ring_full_ = 0, ring_full_logs_ = 0;  // draws dropped for a full frame data ring: this frame, frames logged
   char ring_first_[160] = "";
   uint32_t big_copy_logs_ = 0;
+  uint32_t inst_skipped_ = 0;  // instancing draws dropped since the start (the dk memory line)
   uint32_t ring_full_swap_ = 0;  // swap of the first staging-ring-full event (the first stage frame)
   uint32_t trace_after_full_ = 60;
   uint32_t frame_sprite_draws_ = 0;  // draws of the paletted sprite pixel shader in this frame
