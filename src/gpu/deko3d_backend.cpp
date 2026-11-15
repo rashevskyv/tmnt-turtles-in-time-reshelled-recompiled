@@ -1152,9 +1152,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     } else {
       dkCmdBufDraw(cmd, prim, index_count, 1, 0, 0);
     }
-    Checkpoint(f, "draw VS %016llX PS %016llX n=%u target=%ux%u first_texture=%08X %ux%u",
+    Checkpoint(f, "draw VS %016llX PS %016llX n=%u target=%ux%u sc=%ux%u first_texture=%08X %ux%u",
                (unsigned long long)vs->ucode_data_hash(), (unsigned long long)ps->ucode_data_hash(), index_count,
-               color ? color->width : 0, color ? color->height : 0,
+               color ? color->width : 0, color ? color->height : 0, scissor.width, scissor.height,
                tcount ? tnames[0].base : 0, tcount ? tnames[0].w : 0, tcount ? tnames[0].h : 0);
     if (trace_enabled_ && !traced_) {
       // One line per draw of a gameplay frame (file sdmc:/switch/tmnt/dk_trace): what the HP/MP bar and the
@@ -1710,9 +1710,78 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (!pending) gpu_reported_ = true;
     Log("GPU checkpoints written to %s%s", debug_dir_.c_str(), name);
   }
+  // The GPU time of every step of a finished trail frame (dk_gpu_times_<ordinal>.txt): each report minus the one before.
+  // No deko3d calls here. Draws group by VS, PS, target and scissor; other steps by their first word or two.
+  void WriteStepTimes(const Frame& f, uint32_t ordinal) {
+    if (f.ts_off == UINT32_MAX || !f.checkpoint_data.block || f.checkpoints.empty()) return;
+    const uint64_t* ts = reinterpret_cast<const uint64_t*>(f.data.cpu + f.ts_off);
+    const uint64_t t0 = ts[1] ? ts[1] : ts[0], t1 = ts[3] ? ts[3] : ts[2];
+    auto ms = [](uint64_t ticks) { return double(dkTimestampToNs(ticks)) / 1e6; };
+    struct Group { uint32_t count = 0; uint64_t total = 0, max = 0, indices = 0; };
+    std::unordered_map<std::string, Group> groups;
+    std::vector<uint64_t> step(f.checkpoints.size());
+    uint64_t prev = t0, sum = 0;
+    uint32_t bad = 0;
+    for (size_t i = 0; i < f.checkpoints.size(); i++) {
+      const uint64_t* report = reinterpret_cast<const uint64_t*>(f.checkpoint_data.cpu + i * 16);
+      const uint64_t t = report[1] ? report[1] : report[0];
+      if (!t || t < prev) bad++;  // the same tick as the step before is a real 0
+      else step[i] = t - prev;
+      prev = std::max(prev, t);
+      sum += step[i];
+      const std::string& text = f.checkpoints[i];
+      std::string key;
+      uint64_t n = 0;
+      if (text.starts_with("draw ")) {
+        key = text.substr(0, text.find(" first_texture="));
+        if (size_t p = key.find(" n="); p != std::string::npos) {
+          n = std::strtoull(key.c_str() + p + 3, nullptr, 10);
+          key.erase(p, key.find(' ', p + 1) - p);
+        }
+      } else {
+        size_t end = text.find(' ');
+        const std::string first = text.substr(0, end);
+        if (end != std::string::npos && (first == "depth" || first == "present" || (first == "resolve" && text.compare(end, 7, " clear ") == 0)))
+          end = text.find(' ', end + 1);
+        key = text.substr(0, end);
+      }
+      Group& g = groups[key];
+      g.count++;
+      g.total += step[i];
+      g.max = std::max(g.max, step[i]);
+      g.indices += n;
+    }
+    std::vector<std::pair<std::string, Group>> sorted(groups.begin(), groups.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.total > b.second.total; });
+    char header[256];
+    std::snprintf(header, sizeof(header), "GPU step times, swap %u: %zu steps, frame top to bottom %.3f ms, steps sum %.3f ms, %u reports missing or out of order",
+                  f.checkpoint_swap, f.checkpoints.size(), t1 > t0 ? ms(t1 - t0) : 0.0, ms(sum), bad);
+    const char* kNoBarriers = "Reports have no barriers: one step's time can leak into its neighbours; trust group totals, not single steps.";
+    auto group_line = [&](const std::pair<std::string, Group>& e, char* out, size_t size) {
+      std::snprintf(out, size, "%9.3f %5.1f%% %6u %8.3f %10llu  %s", ms(e.second.total), sum ? 100.0 * double(e.second.total) / double(sum) : 0.0,
+                    e.second.count, ms(e.second.max), (unsigned long long)e.second.indices, e.first.c_str());
+    };
+    char line[512];
+    Log("%s", header);
+    for (size_t i = 0; i < sorted.size() && i < 12; i++) { group_line(sorted[i], line, sizeof(line)); Log("  %s", line); }
+    const std::string path = debug_dir_ + "dk_gpu_times_" + std::to_string(ordinal) + ".txt";
+    FILE* out = std::fopen(path.c_str(), "w");
+    if (!out) { Log("GPU step times could not be opened"); return; }
+    std::fprintf(out, "%s\n%s\n total_ms share%%  count   max_ms    indices  key\n", header, kNoBarriers);
+    for (const auto& e : sorted) { group_line(e, line, sizeof(line)); std::fprintf(out, "%s\n", line); }
+    std::fprintf(out, "\nindex ms text\n");
+    for (size_t i = 0; i < f.checkpoints.size(); i++) std::fprintf(out, "%zu %.3f %s\n", i, ms(step[i]), f.checkpoints[i].c_str());
+    const bool write_failed = std::ferror(out) != 0;
+    if (std::fclose(out) != 0 || write_failed) {
+      Log("GPU step times could not be written completely");
+      return;
+    }
+    Log("GPU step times written to %s", path.c_str());
+  }
 
   void BeginFrame() {
     Frame& f = frames_[frame_];
+    bool finished = false;  // the fence wait succeeded and the bottom timestamp is there: WriteStepTimes may read it
     if (f.fenced) {
       if (swaps_ < 6) Log("frame %u: waiting for its fence", frame_);
       const double fw0 = NowMs();
@@ -1729,17 +1798,23 @@ class Deko3dCommandProcessor : public CommandProcessor {
         Log("frame %u: fence done without its end timestamp (GPU fault)", frame_);
         NoteFaultedFrame(f);
       } else {
+        finished = ts != nullptr;
         for (size_t i = 0; i < f.draw_log.size(); i++)
           if (!i || f.draw_log[i] != f.draw_log[i - 1]) ok_pairs_.insert(PairKey(f.draw_log[i]));
       }
       if (swaps_ < 6) Log("frame %u: fence done", frame_);
       f.fenced = false;
     }
-    // ponytail: the trail costs one formatted line and one GPU report per draw, so it ends after 300 finished frames of
-    // 100+ draws (about 10 s of a level). A later fault needs the dk_gpu_checkpoints file.
-    if (trail_ && f.draw_log.size() >= 100 && ++trail_frames_ == 300) {
-      trail_ = false;
-      Log("GPU trail off: 300 frames of 100+ draws finished");
+    // ponytail: the trail costs one formatted line and one GPU report per draw, so it ends after 100 frames of 100+ draws
+    // (about 10 s of a level at 10 fps). Frames 20 and 60 write their step times; the fps before and after the
+    // "GPU trail off" line gives the trail's own cost. A later fault needs the dk_gpu_checkpoints file.
+    if (trail_ && f.draw_log.size() >= 100) {
+      ++trail_frames_;
+      if (finished && (trail_frames_ == 20 || trail_frames_ == 60)) WriteStepTimes(f, trail_frames_ == 20 ? 0 : 1);
+      if (trail_frames_ == 100) {
+        trail_ = false;
+        Log("GPU trail off: 100 frames of 100+ draws finished");
+      }
     }
     f.draw_log.clear();
     f.checkpoints.clear();
