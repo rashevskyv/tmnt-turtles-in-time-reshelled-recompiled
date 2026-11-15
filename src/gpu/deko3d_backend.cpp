@@ -705,6 +705,15 @@ class Deko3dCommandProcessor : public CommandProcessor {
     bool writes_depth = dc.z_enable && dc.z_write_enable;
     if (!writes_color && !writes_depth && !dc.stencil_enable) { skipped_++; return true; }
     if (IsClearDraw(vs, ps, prim_type)) return ClearDraw(index_count, mode);
+    // ponytail: stencil is not implemented (stencilTestEnable = 0 for every draw), so a draw that writes neither
+    // colour nor depth changes nothing; console 0.88 spent 21 ms of a 96 ms level frame on them. When stencil is
+    // implemented these draws must run again, with a trivial fragment shader.
+    if (!writes_color && !writes_depth) {
+      LogOnce("stencilonly", "draw PS %016llX writes neither colour nor depth (stencil only): skipped, stencil is not implemented",
+              (unsigned long long)ps->ucode_data_hash());
+      frame_stencil_only_++;
+      return true;
+    }
     if (!vs->loaded || !ps->loaded) { missing_draws_++; frame_missing_++; return true; }
     DkPrimitive prim;
     bool rects;
@@ -1512,9 +1521,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     frame_uploaded_.clear();
     if (swaps_ <= 3 || swaps_ % 60 == 0) {
       std::printf("[nx] gpu: swap #%u\n", swaps_);  // the Eden gate's frame counter
-      Log("swap #%u: front %08X %ux%u %s; frame: %u draws, %u clears, %u resolves, %u skipped, %u no-shader, %u re-uploads, %llu dirty pages; data %u KB staging %u KB; images %u (%u MB)",
+      Log("swap #%u: front %08X %ux%u %s; frame: %u draws, %u clears, %u resolves, %u skipped, %u stencil-only skipped, %u no-shader, %u re-uploads, %llu dirty pages; data %u KB staging %u KB; images %u (%u MB)",
           swaps_, frontbuffer_ptr, frontbuffer_width, frontbuffer_height, front ? "shown" : "MISSING", frame_draws_,
-          frame_clears_, frame_resolves_, frame_skipped_, frame_missing_, frame_reuploads_, (unsigned long long)(dirty_pages_ - dirty_pages_at_swap_),
+          frame_clears_, frame_resolves_, frame_skipped_, frame_stencil_only_, frame_missing_, frame_reuploads_, (unsigned long long)(dirty_pages_ - dirty_pages_at_swap_),
           f.data.used >> 10, f.staging.used >> 10, image_count_, images_.used >> 20);
     }
     data_peak_ = std::max(data_peak_, f.data.used);
@@ -1525,7 +1534,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     frame_ring_full_ = 0;
     dirty_pages_at_swap_ = dirty_pages_;
-    frame_draws_ = frame_clears_ = frame_resolves_ = frame_skipped_ = frame_missing_ = frame_reuploads_ = 0;
+    frame_draws_ = frame_clears_ = frame_resolves_ = frame_skipped_ = frame_stencil_only_ = frame_missing_ = frame_reuploads_ = 0;
     frame_sprite_draws_ = 0;
     frame_big_tex_ = false;
     frame_mip_only_ = false;
@@ -3372,7 +3381,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
   char hud_text_[32] = "";  // what the present pass draws top-left ("30 FPS  CPU 18.7 MS")
   uint32_t image_count_ = 0, uploads_ = 0, reuploads_ = 0;
   uint64_t upload_bytes_ = 0;
-  uint32_t frame_draws_ = 0, frame_clears_ = 0, frame_resolves_ = 0, frame_skipped_ = 0, frame_missing_ = 0, frame_reuploads_ = 0;
+  uint32_t frame_draws_ = 0, frame_clears_ = 0, frame_resolves_ = 0, frame_skipped_ = 0, frame_stencil_only_ = 0, frame_missing_ = 0,
+           frame_reuploads_ = 0;
   struct Uploaded { uint32_t base, bytes, serial; };  // by value: a recycled image may change hands within the frame
   std::vector<Uploaded> frame_uploaded_;  // uploads of this frame (cleared at the swap)
   uint32_t late_writes_ = 0;               // per second: uploaded textures written again before their frame's swap

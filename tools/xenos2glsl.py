@@ -705,41 +705,52 @@ class Translator:
                 else:
                     out.extend(ind + s for s in b['stmts'])
         else:
+            # Pixel shaders whose jumps all go forward: one "if (pc == N)" guard per block in place of the
+            # while/switch. uam keeps the loop in the compiled code (PS 855F7FF8B200E28B: 816 instructions, 9
+            # texture fetches), about 8x the per-pixel cost on the console. With forward jumps only, pc only grows,
+            # so the guards in block order run the same blocks as the loop. Vertex shaders keep the loop.
+            flat = (self.stage == 'frag'
+                    and all(b['target'] > b['index'] for b in blocks if b['kind'] == 'jmp')
+                    and not any(b['kind'] in ('loop', 'endloop') for b in blocks)
+                    and all(a['index'] < b['index'] for a, b in zip(blocks, blocks[1:])))
+            bi = ind + ('  ' if flat else '    ')  # the indent of a block's statements
             out.append(ind + 'int pc = 0;')
-            out.append(ind + 'while (pc >= 0) {')
-            out.append(ind + '  switch (pc) {')
+            if not flat:
+                out.append(ind + 'while (pc >= 0) {')
+                out.append(ind + '  switch (pc) {')
             for i, b in enumerate(blocks):
-                out.append(ind + '  case %d: {' % b['index'])
+                out.append(ind + (('if (pc == %d) {' if flat else '  case %d: {') % b['index']))
                 nxt = blocks[i + 1]['index'] if i + 1 < len(blocks) else -1
                 if b['kind'] == 'exec':
                     cond = block_cond(b)
                     if cond:
-                        out.append(ind + '    if (%s) {' % cond)
-                        out.extend(ind + '      ' + s for s in b['stmts'])
-                        out.append(ind + '    }')
+                        out.append(bi + 'if (%s) {' % cond)
+                        out.extend(bi + '  ' + s for s in b['stmts'])
+                        out.append(bi + '}')
                     else:
-                        out.extend(ind + '    ' + s for s in b['stmts'])
-                    out.append(ind + '    pc = %d;' % (-1 if b['end'] else nxt))
+                        out.extend(bi + s for s in b['stmts'])
+                    out.append(bi + 'pc = %d;' % (-1 if b['end'] else nxt))
                 elif b['kind'] == 'jmp':
                     cond = block_cond(b)
                     if cond:
-                        out.append(ind + '    pc = (%s) ? %d : %d;' % (cond, b['target'], nxt))
+                        out.append(bi + 'pc = (%s) ? %d : %d;' % (cond, b['target'], nxt))
                     else:
-                        out.append(ind + '    pc = %d;' % b['target'])
+                        out.append(bi + 'pc = %d;' % b['target'])
                 elif b['kind'] == 'loop':  # target: past the endloop when the count is 0
                     n = b['loop']
-                    out.append(ind + '    { uint lc = loops[%d][%d]; lcount_%d = int(lc & 255u); aL = int((lc >> 8) & 255u); '
-                                     'lstep_%d = int(int((lc >> 16) & 255u) << 24) >> 24; li_%d = 0; }' % (n // 4, n % 4, n, n, n))
-                    out.append(ind + '    pc = lcount_%d > 0 ? %d : %d;' % (n, nxt, b['target']))
+                    out.append(bi + '{ uint lc = loops[%d][%d]; lcount_%d = int(lc & 255u); aL = int((lc >> 8) & 255u); '
+                                    'lstep_%d = int(int((lc >> 16) & 255u) << 24) >> 24; li_%d = 0; }' % (n // 4, n % 4, n, n, n))
+                    out.append(bi + 'pc = lcount_%d > 0 ? %d : %d;' % (n, nxt, b['target']))
                 elif b['kind'] == 'endloop':  # target: the loop body
                     n = b['loop']
-                    out.append(ind + '    aL += lstep_%d; pc = ++li_%d < lcount_%d ? %d : %d;' % (n, n, n, b['target'], nxt))
+                    out.append(bi + 'aL += lstep_%d; pc = ++li_%d < lcount_%d ? %d : %d;' % (n, n, n, b['target'], nxt))
                 else:
-                    out.append(ind + '    pc = %d;' % nxt)
-                out.append(ind + '  } break;')
-            out.append(ind + '  default: pc = -1; break;')
-            out.append(ind + '  }')
-            out.append(ind + '}')
+                    out.append(bi + 'pc = %d;' % nxt)
+                out.append(ind + ('}' if flat else '  } break;'))
+            if not flat:
+                out.append(ind + '  default: pc = -1; break;')
+                out.append(ind + '  }')
+                out.append(ind + '}')
         if self.stage == 'vert':
             out.append(ind + 'gl_Position = vec4(oPos.xy * ndc_scale.xy + ndc_offset.xy * oPos.w, '
                              'oPos.z * ndc_scale.z + ndc_offset.z * oPos.w, oPos.w);')
