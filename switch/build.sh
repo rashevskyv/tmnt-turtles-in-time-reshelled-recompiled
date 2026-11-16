@@ -75,14 +75,27 @@ python3 "$SRC/tools/game_icon.py" "$SRC/game/extracted" "$ICON" || rm -f "$ICON"
 # into the NRO (romfs:/shaders/, nx_create_nro ROMFS in switch/switch.cmake), so the NRO is the whole deploy and
 # can not run with another build's shaders (console 0.84 ran with the card's 0.78 folder). The game's shaders come
 # from the trace backend's --dump_shaders directory ($TMNT_SHADER_DUMPS) through tools/xenos2glsl.py + uam.
+# The shader compiler: renut's patched uam 1.1.0 (TMNT_UAM_SRC, built once into $ROOT/uam-build), 6 % fewer
+# pixel shader instructions than devkitPro's uam on the game's shaders. TMNT_UAM=/opt/devkitpro/tools/bin/uam: the stock one.
+UAM_SRC=${TMNT_UAM_SRC:-/mnt/d/git/dev/renut-ref/renut_nx_ultimate_base/app/thirdparty/uam}
+if [ -z "${TMNT_UAM:-}" ]; then
+    if [ ! -x "$ROOT/uam-build/uam" ]; then
+        cmake -S "$UAM_SRC" -B "$ROOT/uam-build" -G Ninja -DCMAKE_BUILD_TYPE=Release > "$ROOT/uam-build.log" 2>&1 &&
+            cmake --build "$ROOT/uam-build" --target uam_tool >> "$ROOT/uam-build.log" 2>&1 ||
+            { tail -20 "$ROOT/uam-build.log"; exit 1; }
+    fi
+    TMNT_UAM=$ROOT/uam-build/uam
+fi
+export UAM=$TMNT_UAM
+echo "uam: $UAM"
 ROMFS=$BUILD/romfs
 rm -rf "$ROMFS"
 mkdir -p "$ROMFS/shaders"
 for s in vert frag; do
-    uam -s $s -o "$ROMFS/shaders/present.$s.dksh" "$SRC/src/gpu/shaders/present.$s"
+    "$UAM" -s $s -o "$ROMFS/shaders/present.$s.dksh" "$SRC/src/gpu/shaders/present.$s"
 done
-uam -s frag -o "$ROMFS/shaders/depthcopy.frag.dksh" "$SRC/src/gpu/shaders/depthcopy.frag"
-uam -s frag -o "$ROMFS/shaders/depthrestore.frag.dksh" "$SRC/src/gpu/shaders/depthrestore.frag"
+"$UAM" -s frag -o "$ROMFS/shaders/depthcopy.frag.dksh" "$SRC/src/gpu/shaders/depthcopy.frag"
+"$UAM" -s frag -o "$ROMFS/shaders/depthrestore.frag.dksh" "$SRC/src/gpu/shaders/depthrestore.frag"
 SHADER_DUMPS=${TMNT_SHADER_DUMPS:-$ROOT/shaders_trace}
 if [ -d "$SHADER_DUMPS" ]; then
     rm -rf "$BUILD/glsl"
