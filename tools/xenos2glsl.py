@@ -18,6 +18,7 @@ Interface of the generated GLSL (the deko3d backend relies on it):
   fragment: layout(location = k) in vec4 i_k       the interpolators it reads (r_k at start);
             layout(binding = n) uniform sampler2D tf_n (1D/3D/Cube by the fetch's dimension);
             layout(location = k) out vec4 oC_k; the alpha test is applied from Sys.
+            shader_<hash>.frag.v1 / .v2 / .v3: without the alpha test / without colour outputs / both (generate()).
 
     python3 tools/xenos2glsl.py in.ucode.vert [-o out.vert] [--json out.json] [--check]
     python3 tools/xenos2glsl.py --all <dump dir> --out <dir> [--check]   (every dump; --check runs uam)
@@ -599,11 +600,16 @@ class Translator:
             else:
                 self.err('unknown instruction %r' % body, line)
         end_block()
+        self.final_blocks = blocks
         return self.generate(blocks)
 
     # ----- output ----------------------------------------------------------------------------
-    def generate(self, blocks):
-        out = ['#version 460', '// tmnt xenos2glsl: %s (%s)' % (self.name, self.stage)]
+    def generate(self, blocks, variant=0):
+        """variant (pixel shaders, the backend picks one per draw): bit 1 = no alpha test (RB_COLORCONTROL test off: a
+        shader without a kill then has no discard, and the GPU tests depth before it runs), bit 2 = no colour outputs (a
+        draw that writes no colour: uam drops what only computed them; the alpha test and the kills stay)."""
+        no_alpha, no_color = variant & 1, variant & 2
+        out = ['#version 460', '// tmnt xenos2glsl: %s (%s)%s' % (self.name, self.stage, ' variant %d' % variant if variant else '')]
         ind = '  '
         if self.stage == 'vert':
             # The same position in a depth pre-pass and in a colour pass (two shaders) must match bit for bit
@@ -629,7 +635,7 @@ class Translator:
         if self.stage == 'vert':
             for k in interps:
                 out.append('layout(location = %d) out vec4 o_%d;' % (k, k))
-        else:
+        elif not no_color:
             for k in colors:
                 out.append('layout(location = %d) out vec4 oC_%d;' % (k, k))
         if self.uses_cube:
@@ -757,7 +763,7 @@ class Translator:
             for k in interps:
                 out.append(ind + 'o_%d = o%d;' % (k, k))
         else:
-            if colors:
+            if colors and not no_alpha:
                 out.append(ind + '// Alpha test (RB_COLORCONTROL): alpha.x enable, alpha.y function, alpha.z reference.')
                 out.append(ind + 'if (alpha.x > 0.5) {')
                 out.append(ind + '  uint f = uint(alpha.y); float a = oC0.w; bool pass = f == 7u || (f == 1u && a < alpha.z) || '
@@ -765,7 +771,7 @@ class Translator:
                                  '(f == 5u && a != alpha.z) || (f == 6u && a >= alpha.z);')
                 out.append(ind + '  if (!pass) discard;')
                 out.append(ind + '}')
-            for k in colors:
+            for k in colors if not no_color else []:
                 out.append(ind + 'oC_%d = oC%d;' % (k, k))
         out.append('}')
         meta = {
@@ -824,6 +830,8 @@ def translate_file(path):
             raise SystemExit('%s: instancing shader without the c19.x divisor, one index bias or an instance stream' % name)
         const, comp = bias.pop()
         meta['instance_bias'] = [int(const), 'xyzw'.index(comp)]
+    # Pixel shaders: the variants 1-3 (Translator.generate), shader_<hash>.frag.v<n>.glsl.
+    meta['variants'] = [t.generate(t.final_blocks, v)[0] for v in (1, 2, 3)] if stage == 'frag' and meta['colors'] else []
     return glsl, meta
 
 
@@ -859,7 +867,15 @@ def main():
             stem = f.replace('.ucode.', '.')
             dst = os.path.join(args.out_dir or args.all, stem + '.glsl')
             open(dst, 'w', newline='\n').write(glsl)
+            variants = meta.pop('variants')
             open(dst.replace('.glsl', '.json'), 'w', newline='\n').write(json.dumps(meta, indent=1))
+            for v, text in enumerate(variants, 1):
+                vdst = os.path.join(args.out_dir or args.all, '%s.v%d.glsl' % (stem, v))
+                open(vdst, 'w', newline='\n').write(text)
+                if args.check:
+                    good, msg = uam_check(vdst, 'frag')
+                    if not good:
+                        print('FAIL %s: %s' % (os.path.basename(vdst), msg))
             if meta.get('instanced'):
                 # For the backend (staged next to the DKSH): the bias constant and its component, then the fetch
                 # constants (95 - slot, as the SDK numbers them) of the per-instance streams.
@@ -882,6 +898,7 @@ def main():
         print('%d of %d translated' % (ok, len(files)))
         return
     glsl, meta = translate_file(args.input)
+    meta.pop('variants')
     if args.out:
         open(args.out, 'w', newline='\n').write(glsl)
         if args.check:

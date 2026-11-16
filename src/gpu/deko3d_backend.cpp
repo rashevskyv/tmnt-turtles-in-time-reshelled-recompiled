@@ -225,6 +225,9 @@ class DkShaderObj : public Shader {
   bool loaded = false;
   DkShader geom{};           // vertex shaders: the rectangle-list geometry shader
   bool geom_loaded = false;
+  // Pixel shaders: xenos2glsl's variants .v1 (no alpha test), .v2 (no colour outputs), .v3 (both), picked per draw.
+  DkShader variant[3]{};
+  bool variant_loaded[3] = {};
   // Vertex shaders with computed fetch indices: the game's instancing shaders (xenos2glsl .vert.inst, instancing.h).
   bool instanced = false;
   uint32_t inst_bias = 0;       // the index bias: float constant register (constant * 4 + component)
@@ -560,6 +563,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     size_t cut = shader_dir_.size() >= 2 ? shader_dir_.rfind('/', shader_dir_.size() - 2) : std::string::npos;
     std::string debug_dir = cut == std::string::npos ? "" : shader_dir_.substr(0, cut + 1);
     present_target_ = access((debug_dir + "dk_present_rt").c_str(), F_OK) == 0;
+    no_variants_ = access((debug_dir + "dk_no_variants").c_str(), F_OK) == 0;
+    if (no_variants_) Log("dk_no_variants: every draw binds the full pixel shader");
     dump_images_ = access((debug_dir + "dk_dump").c_str(), F_OK) == 0;  // readback dumps stall the GPU: debug only
     debug_dir_ = debug_dir;
     gpu_checkpoints_ = access((debug_dir + "dk_gpu_checkpoints").c_str(), F_OK) == 0;
@@ -642,6 +647,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
     std::snprintf(name, sizeof(name), "%sshader_%016llX.%s.dksh", shader_dir_.c_str(), (unsigned long long)hash,
                   shader_type == xenos::ShaderType::kVertex ? "vert" : "frag");
     shader->loaded = LoadDksh(name, shader->shader);
+    if (shader->loaded && shader_type == xenos::ShaderType::kPixel) {
+      for (uint32_t v = 0; v < 3; v++) {
+        std::snprintf(name, sizeof(name), "%sshader_%016llX.frag.v%u.dksh", shader_dir_.c_str(), (unsigned long long)hash, v + 1);
+        shader->variant_loaded[v] = LoadDksh(name, shader->variant[v]);
+      }
+    }
     if (shader->loaded && shader_type == xenos::ShaderType::kVertex) {
       std::snprintf(name, sizeof(name), "%sshader_%016llX.geom.dksh", shader_dir_.c_str(), (unsigned long long)hash);
       shader->geom_loaded = LoadDksh(name, shader->geom);
@@ -1003,8 +1014,34 @@ class Deko3dCommandProcessor : public CommandProcessor {
     dkCmdBufBindDepthStencilState(cmd, &ds);
 
     if (!skip_pairs_.empty() && skip_pairs_.count(PairKey({vs->ucode_data_hash(), ps->ucode_data_hash()}))) { skipped_++; return true; }
+    // The pixel shader's bool constants (the words it reads, masked by its bitmap) and the alpha test, once per
+    // combination: what bool-constant variants of a shader would have to cover (no log had the values before).
+    const auto cc = regs.Get<reg::RB_COLORCONTROL>();
+    {
+      const auto& bmap = ps->constant_register_map();
+      uint64_t key = ps->ucode_data_hash() * 0xC2B2AE3D27D4EB4Full ^ (uint64_t(cc.alpha_test_enable) << 8 | uint32_t(cc.alpha_func));
+      char bools[128] = "";
+      int len = 0;
+      for (uint32_t w = 0; w < 8; w++) {
+        if (!bmap.bool_bitmap[w]) continue;
+        uint32_t value;
+        std::memcpy(&value, &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + w], 4);
+        value &= bmap.bool_bitmap[w];
+        key = (key ^ (uint64_t(w) << 32 | value)) * 0x100000001B3ull;
+        len += std::snprintf(bools + len, sizeof(bools) - len, " b%u-%u %08X", w * 32, w * 32 + 31, value);
+      }
+      if (FirstTime(key))
+        Log("PS %016llX constants: bools%s, alpha test %u func %u", (unsigned long long)ps->ucode_data_hash(),
+            len ? bools : " none", uint32_t(cc.alpha_test_enable), uint32_t(cc.alpha_func));
+    }
+    // The pixel shader's variant (xenos2glsl generate()): without the alpha test when it is off (a shader without a kill
+    // then has no discard, and the GPU tests depth before it runs), without colour outputs when the draw writes no colour.
+    // The file dk_no_variants (next to the shaders folder) keeps the full shader for every draw: the A/B.
+    const uint32_t variant = no_variants_ ? 0 : (cc.alpha_test_enable ? 0u : 1u) | (cw.masks ? 0u : 2u);
+    const DkShader* fs = depth_restore ? &restore_fs_shader_
+                         : variant && ps->variant_loaded[variant - 1] ? &ps->variant[variant - 1] : &ps->shader;
     // Shaders (the whole graphics mask: a stage without a shader here is unbound).
-    DkShader const* shaders[3] = {&vs->shader, depth_restore ? &restore_fs_shader_ : &ps->shader, &vs->geom};
+    DkShader const* shaders[3] = {&vs->shader, fs, &vs->geom};
     dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, shaders, use_gs ? 3 : 2);
     phase(3);
 
@@ -3261,6 +3298,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   DkShader restore_fs_shader_{};  // depthrestore.frag (the XDK depth restore draw)
   bool restore_fs_ = false;
   bool present_target_ = false;
+  bool no_variants_ = false;  // the file dk_no_variants: no pixel shader variants (IssueDrawImpl)
 #ifndef TMNT_DK_GL
   // Port menu RECORD 5 SEC (nx_menu.cpp, switch/host/frame_recorder.cpp, from hcu-switch): the 1920x1080 guest front buffer of each
   // drawn frame is copied into rec_ (one slot per frame in flight) and handed to the recorder once the frame's fence has
