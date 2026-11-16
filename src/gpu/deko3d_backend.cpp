@@ -1020,19 +1020,21 @@ class Deko3dCommandProcessor : public CommandProcessor {
     {
       const auto& bmap = ps->constant_register_map();
       uint64_t key = ps->ucode_data_hash() * 0xC2B2AE3D27D4EB4Full ^ (uint64_t(cc.alpha_test_enable) << 8 | uint32_t(cc.alpha_func));
-      char bools[128] = "";
-      int len = 0;
+      uint32_t value[8];
       for (uint32_t w = 0; w < 8; w++) {
-        if (!bmap.bool_bitmap[w]) continue;
-        uint32_t value;
-        std::memcpy(&value, &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + w], 4);
-        value &= bmap.bool_bitmap[w];
-        key = (key ^ (uint64_t(w) << 32 | value)) * 0x100000001B3ull;
-        len += std::snprintf(bools + len, sizeof(bools) - len, " b%u-%u %08X", w * 32, w * 32 + 31, value);
+        std::memcpy(&value[w], &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + w], 4);
+        value[w] &= bmap.bool_bitmap[w];
+        key = (key ^ (uint64_t(w) << 32 | value[w])) * 0x100000001B3ull;
       }
-      if (FirstTime(key))
+      if (FirstTime(key)) {
+        char bools[8 * 20 + 8] = "";  // 8 words of " b224-255 XXXXXXXX" (18 characters) at most
+        int len = 0;
+        for (uint32_t w = 0; w < 8; w++)
+          if (bmap.bool_bitmap[w])
+            len += std::snprintf(bools + len, sizeof(bools) - len, " b%u-%u %08X", w * 32, w * 32 + 31, value[w]);
         Log("PS %016llX constants: bools%s, alpha test %u func %u", (unsigned long long)ps->ucode_data_hash(),
             len ? bools : " none", uint32_t(cc.alpha_test_enable), uint32_t(cc.alpha_func));
+      }
     }
     // The pixel shader's variant (xenos2glsl generate()): without the alpha test when it is off (a shader without a kill
     // then has no discard, and the GPU tests depth before it runs), without colour outputs when the draw writes no colour.
