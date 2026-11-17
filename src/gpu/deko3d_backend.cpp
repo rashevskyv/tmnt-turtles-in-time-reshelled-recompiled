@@ -2148,7 +2148,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
     uint32_t rows = tiles ? uint32_t((uint64_t(tiles) * 80 * 16) / pitch) : 0;
     if (rows > kMaxTargetHeight) rows = kMaxTargetHeight;
     if (rows < 16) rows = 16;
-    HostImage* img = CreateImage(pitch, rows, format, DkImageFlags_UsageRender, is_depth);
+    // Depth targets get the hardware Z compression (deko3d pickImageMemoryKind: Z24S8 -> NvKind_Z24S8_2CZ, which
+    // needs block-linear tiling and an Image memblock: the image pool has both and already hosts the compressed
+    // swapchain). No CopyImage takes a depth target; ResolveDepth samples it, which the kind allows (renut §13/§16).
+    HostImage* img = CreateImage(pitch, rows, format,
+                                 is_depth ? DkImageFlags_UsageRender | DkImageFlags_HwCompression : DkImageFlags_UsageRender,
+                                 is_depth);
     if (!img) return nullptr;
     img->edram_base = edram_base;
     img->edram_pitch = pitch;
