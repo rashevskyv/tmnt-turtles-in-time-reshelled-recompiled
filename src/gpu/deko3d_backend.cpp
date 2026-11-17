@@ -228,6 +228,7 @@ class DkShaderObj : public Shader {
   // Pixel shaders: xenos2glsl's variants .v1 (no alpha test), .v2 (no colour outputs), .v3 (both), picked per draw.
   DkShader variant[3]{};
   bool variant_loaded[3] = {};
+  bool tex_sizes = false;  // pixel shaders: reads the bound textures' sizes from TexSize, binding 2 (xenos2glsl .frag.tsize)
   // Vertex shaders with computed fetch indices: the game's instancing shaders (xenos2glsl .vert.inst, instancing.h).
   bool instanced = false;
   uint32_t inst_bias = 0;       // the index bias: float constant register (constant * 4 + component)
@@ -272,6 +273,8 @@ struct Frame {
   const void* vs_uni_shader = nullptr;
   const void* ps_uni_shader = nullptr;
   SysConstants last_sys{};
+  uint32_t tsize_uni = UINT32_MAX;  // the TexSize block bound last (IssueDrawImpl), and its values: width, height per slot
+  float last_tsize[64] = {};
   // Texture bindings of this frame by fetch constant (+ shader binding): the image, its descriptor+sampler handle
   // and the memory range to re-check (console 0.200: the tex phase was 3.5 ms per frame at ~1.3 bindings per draw).
   struct TexBind {
@@ -652,6 +655,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
         std::snprintf(name, sizeof(name), "%sshader_%016llX.frag.v%u.dksh", shader_dir_.c_str(), (unsigned long long)hash, v + 1);
         shader->variant_loaded[v] = LoadDksh(name, shader->variant[v]);
       }
+      std::snprintf(name, sizeof(name), "%sshader_%016llX.frag.tsize", shader_dir_.c_str(), (unsigned long long)hash);
+      shader->tex_sizes = access(name, F_OK) == 0;
     }
     if (shader->loaded && shader_type == xenos::ShaderType::kVertex) {
       std::snprintf(name, sizeof(name), "%sshader_%016llX.geom.dksh", shader_dir_.c_str(), (unsigned long long)hash);
@@ -1190,6 +1195,27 @@ class Deko3dCommandProcessor : public CommandProcessor {
 
     // Uniforms: the ALU constants and the system constants, per stage.
     if (!BindUniforms(f, vs, ps, vi, regs)) { skipped_++; return true; }
+    // The bound textures' sizes for the pixel shaders that read them (xenos2glsl tex_size, TexSize at binding 2) in
+    // place of textureSize, a TXQ each (renut 2.32). The values are the images' own sizes, what textureSize returns.
+    // A slot this draw does not bind keeps an older value: a shader reads only the slots it binds.
+    if (ps->tex_sizes) {
+      float ts[64];
+      std::memcpy(ts, f.last_tsize, sizeof(ts));
+      for (uint32_t i = 0; i < tcount; i++) {
+        if (tnames[i].fc >= 32) continue;
+        ts[tnames[i].fc * 2] = float(tnames[i].w);
+        ts[tnames[i].fc * 2 + 1] = float(tnames[i].h);
+      }
+      if (f.tsize_uni == UINT32_MAX || std::memcmp(ts, f.last_tsize, sizeof(ts)) != 0) {
+        const uint32_t off = f.data.Alloc(sizeof(ts), DK_UNIFORM_BUF_ALIGNMENT);
+        if (off == UINT32_MAX) { RingFull(f, "uniforms", sizeof(ts), vs->ucode_data_hash()); skipped_++; return true; }
+        std::memcpy(f.data.cpu + off, ts, sizeof(ts));
+        std::memcpy(f.last_tsize, ts, sizeof(ts));
+        f.tsize_uni = off;
+        const DkBufExtents buf{f.data.gpu + off, sizeof(ts)};
+        dkCmdBufBindUniformBuffers(cmd, DkStage_Fragment, 2, &buf, 1);
+      }
+    }
     phase(5);
 
     dkCmdBufSetPrimitiveRestart(cmd, restart, restart_index);
@@ -1915,7 +1941,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     dkCmdBufBindSamplerDescriptorSet(f.cmdbuf, descriptors_.gpu + sampler_desc_offset_, kSamplerCount);
     std::fill(std::begin(bound_colors_), std::end(bound_colors_), nullptr);
     bound_depth_ = nullptr;
-    f.vs_uni = f.ps_uni = f.sys_uni = UINT32_MAX;
+    f.vs_uni = f.ps_uni = f.sys_uni = f.tsize_uni = UINT32_MAX;
     f.vs_uni_shader = f.ps_uni_shader = nullptr;
   }
 
@@ -2786,7 +2812,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     data_peak_ = std::max(data_peak_, f.data.used);
     f.data.used = f.ts_off != UINT32_MAX ? f.ts_off + 32 : 0;  // the frame's timestamps stay
     frame_serial_++;  // the ring copies of FindCopy are gone
-    f.vs_uni = f.ps_uni = f.sys_uni = UINT32_MAX;
+    f.vs_uni = f.ps_uni = f.sys_uni = f.tsize_uni = UINT32_MAX;
     f.vs_uni_shader = f.ps_uni_shader = nullptr;
     ring_flushes_++;
   }

@@ -109,6 +109,10 @@ if [ -d "$SHADER_DUMPS" ]; then
     for f in "$BUILD"/glsl/*.vert.inst; do
         [ -f "$f" ] && cp "$f" "$ROMFS/shaders/"
     done
+    # The pixel shaders that read the texture sizes from the TexSize buffer (xenos2glsl tex_size): one marker each.
+    for f in "$BUILD"/glsl/*.frag.tsize; do
+        [ -f "$f" ] && cp "$f" "$ROMFS/shaders/"
+    done
 fi
 
 cmake -S "$SRC" -B "$BUILD" -G Ninja \

@@ -18,6 +18,8 @@ Interface of the generated GLSL (the deko3d backend relies on it):
   fragment: layout(location = k) in vec4 i_k       the interpolators it reads (r_k at start);
             layout(binding = n) uniform sampler2D tf_n (1D/3D/Cube by the fetch's dimension);
             layout(location = k) out vec4 oC_k; the alpha test is applied from Sys.
+            binding 2 = uniform TexSize { vec4 tsize[16]; } (the bound textures' sizes, slot n in tsize[n / 2].xy / .zw)
+            when the shader needs a texture size; shader_<hash>.frag.tsize (its slots) tells the backend.
             shader_<hash>.frag.v1 / .v2 / .v3: without the alpha test / without colour outputs / both (generate()).
 
     python3 tools/xenos2glsl.py in.ucode.vert [-o out.vert] [--json out.json] [--check]
@@ -76,6 +78,7 @@ class Translator:
         self.uses_a0 = False
         self.uses_cube = False
         self.uses_lod = False
+        self.tex_sizes = set()  # pixel shaders: texture slots whose size comes from TexSize (tex_size)
         self.stride_words = 0
         self.pending_serialize = False
         self.indent = '  '
@@ -272,11 +275,11 @@ class Translator:
             k = p.split('=')[0]
             if p == 'UnnormalizedTextureCoords=true':
                 # Texel coordinates (TMNT's full-screen copy, 894498C723463852: without it the frame stayed black).
-                coord = '(%s) / vec2(textureSize(tf_%d, 0))' % (coord, int(parts[2][2:]))
+                coord = '(%s) / %s' % (coord, self.tex_size(slot))
             elif k in ('OffsetX', 'OffsetY') and dim == '2D':
                 # A texel offset (TMNT's shadow filter taps).
                 off = 'vec2(%s, 0.0)' if k == 'OffsetX' else 'vec2(0.0, %s)'
-                coord = '((%s) + %s / vec2(textureSize(tf_%d, 0)))' % (coord, off % p.split('=')[1], slot)
+                coord = '((%s) + %s / %s)' % (coord, off % p.split('=')[1], self.tex_size(slot))
             elif p == 'UseRegisterLOD=true':
                 lod = 'tex_lod'  # the level setTexLOD set (TMNT's cube reflections)
             elif k not in ('FetchValidOnly', 'UseComputedLOD', 'MagFilter', 'MinFilter', 'MipFilter', 'AnisoFilter'):
@@ -295,6 +298,15 @@ class Translator:
         else:
             self.body.append('vec4 %s = textureLod(tf_%d, %s, 0.0);' % (tmp, slot, coord))
         self.body.extend(self.write_masked(target, comps, tmp, False))
+
+    def tex_size(self, slot):
+        """vec2 of texture slot's level-0 size. Pixel shaders read it from the TexSize buffer (binding 2) the backend
+        fills with the bound images' sizes (renut 2.32): textureSize is a TXQ on Maxwell, at the texture units' rate
+        (PS 50E37CF263DBED92: 4 TXQ). The values are what textureSize returns, the divisions stay: the same results."""
+        if self.stage != 'frag':
+            return 'vec2(textureSize(tf_%d, 0))' % slot
+        self.tex_sizes.add(slot)
+        return 'tsize[%d].%s' % (slot // 2, 'zw' if slot & 1 else 'xy')
 
     def tmp_counter(self):
         # Per translation: the output of a shader does not depend on what was translated before it.
@@ -578,8 +590,8 @@ class Translator:
                 slot = int(parts[2][2:])
                 kv = dict(x.split('=', 1) for x in parts[3:])
                 tmp = 'w%d' % self.tmp_counter()
-                self.body.append('vec2 %s = fract((%s) * vec2(textureSize(tf_%d, 0)) - 0.5 + vec2(%s, %s));' % (
-                    tmp, coord, slot, kv.get('OffsetX', '0.0'), kv.get('OffsetY', '0.0')))
+                self.body.append('vec2 %s = fract((%s) * %s - 0.5 + vec2(%s, %s));' % (
+                    tmp, coord, self.tex_size(slot), kv.get('OffsetX', '0.0'), kv.get('OffsetY', '0.0')))
                 self.body.extend(self.write_masked(target, comps, 'vec4(%s, 0.0, 0.0)' % tmp, False))
                 continue
             if pred is not None and len(self.body) > start and (op in ('vfetch_full', 'vfetch_mini') or op.startswith('tfetch')):
@@ -630,6 +642,8 @@ class Translator:
                 out.append('layout(binding = %d) uniform sampler%s tf_%d;' % (slot, self.textures[slot], slot))
         out.append('layout(std140, binding = 0) uniform Consts { vec4 c[256]; };')
         out.append('layout(std140, binding = 1) uniform Sys { vec4 ndc_scale; vec4 ndc_offset; vec4 alpha; uvec4 bools[2]; uvec4 loops[8]; };')
+        if self.tex_sizes:
+            out.append('layout(std140, binding = 2) uniform TexSize { vec4 tsize[16]; };  // slot n: tsize[n / 2].xy (even) / .zw (odd)')
         interps = sorted(int(e[1:]) for e in self.exports if re.match(r'^o\d+$', e))
         colors = sorted(int(e[2:]) for e in self.exports if e.startswith('oC'))
         if self.stage == 'vert':
@@ -780,7 +794,7 @@ class Translator:
             'textures': {str(k): v for k, v in sorted(self.textures.items())},
             'interpolators': interps, 'inputs': sorted(self.reads_before_write) if self.stage == 'frag' else [],
             'colors': colors, 'has_jump': self.has_jump, 'uses_bools': self.uses_bools, 'kill': self.has_kill,
-            'instanced': self.instanced,
+            'instanced': self.instanced, 'tex_sizes': sorted(self.tex_sizes),
             'instance_slots': sorted(s for s, c in self.stream_class.items() if c == 'instance'),
         }
         return '\n'.join(out) + '\n', meta
@@ -881,6 +895,9 @@ def main():
                 # constants (95 - slot, as the SDK numbers them) of the per-instance streams.
                 open(dst.replace('.glsl', '.inst'), 'w', newline='\n').write('%d %d %s\n' % (
                     *meta['instance_bias'], ' '.join(str(95 - s) for s in meta['instance_slots'])))
+            if meta['tex_sizes']:
+                # For the backend (staged next to the DKSH): this pixel shader reads the TexSize buffer; its slots.
+                open(dst.replace('.glsl', '.tsize'), 'w', newline='\n').write(' '.join(map(str, meta['tex_sizes'])) + '\n')
             if args.check:
                 good, msg = uam_check(dst, meta['stage'])
                 print('%s %s%s' % ('OK  ' if good else 'FAIL', stem, '' if good else ': ' + msg))
