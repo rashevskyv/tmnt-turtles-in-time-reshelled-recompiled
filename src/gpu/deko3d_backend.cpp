@@ -228,6 +228,11 @@ class DkShaderObj : public Shader {
   // Pixel shaders: xenos2glsl's variants .v1 (no alpha test), .v2 (no colour outputs), .v3 (both), picked per draw.
   DkShader variant[3]{};
   bool variant_loaded[3] = {};
+  // Pixel shaders specialised by the bool word b128-159 (xenos2glsl BOOL_VARIANTS, .frag.bools lists the values):
+  // .b<value>.v1 / .v3, picked when the alpha test is off and the masked word holds bool_value[k].
+  uint32_t bool_count = 0, bool_value[4] = {};
+  DkShader bool_variant[4][2]{};  // [value][v1, v3]
+  bool bool_loaded[4][2] = {};
   bool tex_sizes = false;  // pixel shaders: reads the bound textures' sizes from TexSize, binding 2 (xenos2glsl .frag.tsize)
   // Vertex shaders with computed fetch indices: the game's instancing shaders (xenos2glsl .vert.inst, instancing.h).
   bool instanced = false;
@@ -655,6 +660,21 @@ class Deko3dCommandProcessor : public CommandProcessor {
         std::snprintf(name, sizeof(name), "%sshader_%016llX.frag.v%u.dksh", shader_dir_.c_str(), (unsigned long long)hash, v + 1);
         shader->variant_loaded[v] = LoadDksh(name, shader->variant[v]);
       }
+      std::snprintf(name, sizeof(name), "%sshader_%016llX.frag.bools", shader_dir_.c_str(), (unsigned long long)hash);
+      if (FILE* fp = std::fopen(name, "r")) {
+        unsigned value = 0;
+        while (shader->bool_count < 4 && std::fscanf(fp, "%x", &value) == 1) {
+          const uint32_t k = shader->bool_count++;
+          shader->bool_value[k] = value;
+          for (uint32_t j = 0; j < 2; j++) {
+            std::snprintf(name, sizeof(name), "%sshader_%016llX.frag.b%08X.v%u.dksh", shader_dir_.c_str(),
+                          (unsigned long long)hash, value, j ? 3u : 1u);
+            shader->bool_loaded[k][j] = LoadDksh(name, shader->bool_variant[k][j]);
+          }
+        }
+        std::fclose(fp);
+        Log("PS %016llX: %u bool-constant variant(s) (b128-159)", (unsigned long long)hash, shader->bool_count);
+      }
       std::snprintf(name, sizeof(name), "%sshader_%016llX.frag.tsize", shader_dir_.c_str(), (unsigned long long)hash);
       shader->tex_sizes = access(name, F_OK) == 0;
     }
@@ -1022,31 +1042,42 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // The pixel shader's bool constants (the words it reads, masked by its bitmap) and the alpha test, once per
     // combination: what bool-constant variants of a shader would have to cover (no log had the values before).
     const auto cc = regs.Get<reg::RB_COLORCONTROL>();
-    {
-      const auto& bmap = ps->constant_register_map();
-      uint64_t key = ps->ucode_data_hash() * 0xC2B2AE3D27D4EB4Full ^ (uint64_t(cc.alpha_test_enable) << 8 | uint32_t(cc.alpha_func));
-      uint32_t value[8];
-      for (uint32_t w = 0; w < 8; w++) {
-        std::memcpy(&value[w], &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + w], 4);
-        value[w] &= bmap.bool_bitmap[w];
-        key = (key ^ (uint64_t(w) << 32 | value[w])) * 0x100000001B3ull;
-      }
-      if (FirstTime(key)) {
-        char bools[8 * 20 + 8] = "";  // 8 words of " b224-255 XXXXXXXX" (18 characters) at most
-        int len = 0;
-        for (uint32_t w = 0; w < 8; w++)
-          if (bmap.bool_bitmap[w])
-            len += std::snprintf(bools + len, sizeof(bools) - len, " b%u-%u %08X", w * 32, w * 32 + 31, value[w]);
-        Log("PS %016llX constants: bools%s, alpha test %u func %u", (unsigned long long)ps->ucode_data_hash(),
-            len ? bools : " none", uint32_t(cc.alpha_test_enable), uint32_t(cc.alpha_func));
-      }
-    }
     // The pixel shader's variant (xenos2glsl generate()): without the alpha test when it is off (a shader without a kill
     // then has no discard, and the GPU tests depth before it runs), without colour outputs when the draw writes no colour.
     // The file dk_no_variants (next to the shaders folder) keeps the full shader for every draw: the A/B.
     const uint32_t variant = no_variants_ ? 0 : (cc.alpha_test_enable ? 0u : 1u) | (cw.masks ? 0u : 2u);
     const DkShader* fs = depth_restore ? &restore_fs_shader_
                          : variant && ps->variant_loaded[variant - 1] ? &ps->variant[variant - 1] : &ps->shader;
+    const auto& bmap = ps->constant_register_map();
+    uint32_t value[8];
+    for (uint32_t w = 0; w < 8; w++) {
+      std::memcpy(&value[w], &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + w], 4);
+      value[w] &= bmap.bool_bitmap[w];
+    }
+    // With the alpha test off: the variant specialised for this bool word b128-159 (BOOL_VARIANTS), when there is one.
+    int bool_k = -1;
+    if (!depth_restore && (variant & 1))
+      for (uint32_t k = 0; k < ps->bool_count; k++)
+        if (value[4] == ps->bool_value[k] && ps->bool_loaded[k][variant >> 1]) { fs = &ps->bool_variant[k][variant >> 1]; bool_k = int(k); }
+    // The pixel shader's bool constants (the words it reads, masked by its bitmap), the alpha test and the variant, once
+    // per combination: what bool-constant variants of a shader have to cover.
+    {
+      uint64_t key = ps->ucode_data_hash() * 0xC2B2AE3D27D4EB4Full ^
+                     (uint64_t(variant) << 12 | uint64_t(cc.alpha_test_enable) << 8 | uint32_t(cc.alpha_func));
+      for (uint32_t w = 0; w < 8; w++) key = (key ^ (uint64_t(w) << 32 | value[w])) * 0x100000001B3ull;
+      if (FirstTime(key)) {
+        char bools[8 * 20 + 8] = "";  // 8 words of " b224-255 XXXXXXXX" (18 characters) at most
+        int len = 0;
+        for (uint32_t w = 0; w < 8; w++)
+          if (bmap.bool_bitmap[w])
+            len += std::snprintf(bools + len, sizeof(bools) - len, " b%u-%u %08X", w * 32, w * 32 + 31, value[w]);
+        char bound[32];
+        if (bool_k >= 0) std::snprintf(bound, sizeof(bound), "b%08X.v%u", value[4], variant);
+        else std::snprintf(bound, sizeof(bound), "v%u", fs == &ps->shader ? 0u : variant);
+        Log("PS %016llX constants: bools%s, alpha test %u func %u, variant %s", (unsigned long long)ps->ucode_data_hash(),
+            len ? bools : " none", uint32_t(cc.alpha_test_enable), uint32_t(cc.alpha_func), depth_restore ? "restore" : bound);
+      }
+    }
     // Shaders (the whole graphics mask: a stage without a shader here is unbound).
     DkShader const* shaders[3] = {&vs->shader, fs, &vs->geom};
     dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, shaders, use_gs ? 3 : 2);

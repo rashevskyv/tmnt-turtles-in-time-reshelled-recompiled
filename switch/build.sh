@@ -113,6 +113,10 @@ if [ -d "$SHADER_DUMPS" ]; then
     for f in "$BUILD"/glsl/*.frag.tsize; do
         [ -f "$f" ] && cp "$f" "$ROMFS/shaders/"
     done
+    # The pixel shaders with bool-constant variants (xenos2glsl BOOL_VARIANTS): their bool values.
+    for f in "$BUILD"/glsl/*.frag.bools; do
+        [ -f "$f" ] && cp "$f" "$ROMFS/shaders/"
+    done
 fi
 
 cmake -S "$SRC" -B "$BUILD" -G Ninja \

@@ -21,6 +21,8 @@ Interface of the generated GLSL (the deko3d backend relies on it):
             binding 2 = uniform TexSize { vec4 tsize[16]; } (the bound textures' sizes, slot n in tsize[n / 2].xy / .zw)
             when the shader needs a texture size; shader_<hash>.frag.tsize (its slots) tells the backend.
             shader_<hash>.frag.v1 / .v2 / .v3: without the alpha test / without colour outputs / both (generate()).
+            shader_<hash>.frag.b<value>.v1 / .v3: also with the bool word b128-159 fixed (BOOL_VARIANTS, listed in
+            shader_<hash>.frag.bools).
 
     python3 tools/xenos2glsl.py in.ucode.vert [-o out.vert] [--json out.json] [--check]
     python3 tools/xenos2glsl.py --all <dump dir> --out <dir> [--check]   (every dump; --check runs uam)
@@ -42,6 +44,13 @@ SCALAR_OPS = {'adds', 'adds_prev', 'muls', 'muls_prev', 'muls_prev2', 'maxs', 'm
               'kills_one', 'sqrt', 'mulsc', 'addsc', 'subsc', 'sin', 'cos', 'retain_prev'}
 TWO_COMPONENT_SCALAR = {'adds', 'muls', 'maxs', 'mins', 'subs', 'maxas', 'maxasf'}  # one operand, two components
 TWO_OPERAND_SCALAR = {'mulsc', 'addsc', 'subsc'}  # a constant and a register
+# Pixel shaders specialised by the bool word b128-159 (masked by the shader's bool bitmap), the values the Eden log
+# printed in a level (tmnt_log.txt "PS ... constants", 2026-11-17, alpha test off in all). The backend binds
+# .b<value>.v1 / .v3 when the alpha test is off and the word holds one of them (.frag.bools lists them).
+BOOL_VARIANTS = {
+    '855F7FF8B200E28B': (0x40, 0x00, 0x48, 0x02),  # b129 (0x02) is the only kill: off in three of the four
+    '50E37CF263DBED92': (0x00,),                   # no kill; b129 / b130 pick one of two paths
+}
 REPLICATED = {'dp4', 'dp3', 'dp2add', 'max4', 'setp_eq_push', 'setp_ne_push', 'setp_gt_push', 'setp_ge_push',
               'kill_eq', 'kill_gt', 'kill_ge', 'kill_ne'}
 
@@ -616,12 +625,15 @@ class Translator:
         return self.generate(blocks)
 
     # ----- output ----------------------------------------------------------------------------
-    def generate(self, blocks, variant=0):
+    def generate(self, blocks, variant=0, bools=None):
         """variant (pixel shaders, the backend picks one per draw): bit 1 = no alpha test (RB_COLORCONTROL test off: a
         shader without a kill then has no discard, and the GPU tests depth before it runs), bit 2 = no colour outputs (a
-        draw that writes no colour: uam drops what only computed them; the alpha test and the kills stay)."""
+        draw that writes no colour: uam drops what only computed them; the alpha test and the kills stay).
+        bools (BOOL_VARIANTS): the value of the bool word b128-159; every bool condition becomes a literal, so uam drops
+        the dead blocks (PS 855F7FF8B200E28B: its only kill is under b129)."""
         no_alpha, no_color = variant & 1, variant & 2
-        out = ['#version 460', '// tmnt xenos2glsl: %s (%s)%s' % (self.name, self.stage, ' variant %d' % variant if variant else '')]
+        out = ['#version 460', '// tmnt xenos2glsl: %s (%s)%s%s' % (self.name, self.stage, ' variant %d' % variant if variant else '',
+                                                                  ' bools b128-159 %08X' % bools if bools is not None else '')]
         ind = '  '
         if self.stage == 'vert':
             # The same position in a depth pre-pass and in a colour pass (two shaders) must match bit for bit
@@ -694,7 +706,12 @@ class Translator:
                 c = b['cond']
                 neg = c.startswith('!')
                 n = int(c.lstrip('!b'))
-                conds.append('%s(((bools[%d][%d] >> %du) & 1u) != 0u)' % ('!' if neg else '', n // 128, (n % 128) // 32, n % 32))
+                if bools is not None:
+                    if not 128 <= n < 160:
+                        self.err('bool b%d outside b128-159 in a BOOL_VARIANTS shader' % n)
+                    conds.append('%s(%s)' % ('!' if neg else '', 'true' if bools >> (n - 128) & 1 else 'false'))
+                else:
+                    conds.append('%s(((bools[%d][%d] >> %du) & 1u) != 0u)' % ('!' if neg else '', n // 128, (n % 128) // 32, n % 32))
             return ' && '.join(conds)
 
         if self.has_loop:
@@ -846,6 +863,10 @@ def translate_file(path):
         meta['instance_bias'] = [int(const), 'xyzw'.index(comp)]
     # Pixel shaders: the variants 1-3 (Translator.generate), shader_<hash>.frag.v<n>.glsl.
     meta['variants'] = [t.generate(t.final_blocks, v)[0] for v in (1, 2, 3)] if stage == 'frag' and meta['colors'] else []
+    # BOOL_VARIANTS: the alpha-test-off variants 1 and 3 per bool value, shader_<hash>.frag.b<value>.v<n>.glsl.
+    values = BOOL_VARIANTS.get(name[7:23], ()) if stage == 'frag' and meta['colors'] else ()
+    meta['bool_values'] = list(values)
+    meta['bool_variants'] = [(b, v, t.generate(t.final_blocks, v, b)[0]) for b in values for v in (1, 3)]
     return glsl, meta
 
 
@@ -881,10 +902,15 @@ def main():
             stem = f.replace('.ucode.', '.')
             dst = os.path.join(args.out_dir or args.all, stem + '.glsl')
             open(dst, 'w', newline='\n').write(glsl)
-            variants = meta.pop('variants')
+            variants = [('%s.v%d.glsl' % (stem, v), text) for v, text in enumerate(meta.pop('variants'), 1)]
+            variants += [('%s.b%08X.v%d.glsl' % (stem, b, v), text) for b, v, text in meta.pop('bool_variants')]
+            bool_values = meta.pop('bool_values')
             open(dst.replace('.glsl', '.json'), 'w', newline='\n').write(json.dumps(meta, indent=1))
-            for v, text in enumerate(variants, 1):
-                vdst = os.path.join(args.out_dir or args.all, '%s.v%d.glsl' % (stem, v))
+            if bool_values:
+                # For the backend (staged next to the DKSH): the bool values of the .b<value> variants, hex.
+                open(dst.replace('.glsl', '.bools'), 'w', newline='\n').write(' '.join('%08X' % b for b in bool_values) + '\n')
+            for vname, text in variants:
+                vdst = os.path.join(args.out_dir or args.all, vname)
                 open(vdst, 'w', newline='\n').write(text)
                 if args.check:
                     good, msg = uam_check(vdst, 'frag')
@@ -916,6 +942,8 @@ def main():
         return
     glsl, meta = translate_file(args.input)
     meta.pop('variants')
+    meta.pop('bool_variants')
+    meta.pop('bool_values')
     if args.out:
         open(args.out, 'w', newline='\n').write(glsl)
         if args.check:
