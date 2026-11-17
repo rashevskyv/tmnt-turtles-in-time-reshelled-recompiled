@@ -33,6 +33,7 @@ void rex_nx_membench(void);
 // memory_nx.cpp: the RAM behind the guest memory, taken first; the physical (0xA0000000) block.
 void rex_nx_reserve_pool(void);
 const uint8_t* rex_nx_physical_base(void);
+unsigned rex_nx_release_memory(void);
 // libnx's heap bounds (newlib.c).
 extern char* fake_heap_start;
 extern char* fake_heap_end;
@@ -159,6 +160,23 @@ void restore_clocks() {
     svcExitProcess();
 }
 
+// hbloader's return when hbmenu started the NRO (hbloader then loads hbmenu again), kept before end_process takes its
+// place; null for Eden or an NSO, or with the file sdmc:/switch/tmnt/exithome (the old way out: the HOME menu).
+LoaderReturnFn loader_return = nullptr;
+Thread* main_thread = nullptr;
+// An exit asked on another thread, for the UI loop (rex_nx_quick_exit); set once a thread is on its way out.
+std::atomic<const char*> exit_request{nullptr};
+std::atomic<bool> exit_claimed{false};
+
+// The way back to hbloader, after libnx's exit has closed the window, hid, the applet and fs: the GPU's nvdrv session
+// (its mappings and the 32 MB transfer memory in the heap) and audout go too, as hbloader loads hbmenu into this
+// process and its heap. A service exit is a no-op once its count is 0.
+[[noreturn]] void return_to_loader(int rc) {
+    for (int i = 0; i < 8; i++) nvExit();
+    for (int i = 0; i < 8; i++) audoutExit();
+    loader_return(rc);
+}
+
 // Per-thread CPU time (svcGetInfo ThreadTickCount) for the 2-s profile line: which thread burns the
 // time, the guest's, the GPU command processor's or another. Threads register in the create wrap
 // (libnx's pthread_t is its Thread*), names come from the SDK's pthread_setname_np.
@@ -176,6 +194,7 @@ struct NxThread {
 };
 NxThread nx_threads[64];
 Mutex nx_threads_lock;
+bool nx_threads_full = false;  // a thread found no slot: it is never paused, so the exit cannot return to hbloader
 // Ticks each thread spent blocked in the SDK's wait primitives (threading_switch.cpp's WaitScope adds them
 // through rex_nx_waited_add): busy = wall - waited, the CPU work measure that Eden can give (its
 // ThreadTickCount is 0). Sleeps (svcSleepThread) and the guest's own spins count as busy.
@@ -262,9 +281,11 @@ void register_thread(Thread* thread, const char* name) {
             t.prio_logs = 0;
             t.counted = false;
             rex_nx_waited_ticks[&t - nx_threads] = 0;
-            break;
+            mutexUnlock(&nx_threads_lock);
+            return;
         }
     }
+    nx_threads_full = true;
     mutexUnlock(&nx_threads_lock);
 }
 
@@ -771,8 +792,14 @@ extern "C" void userAppInit(void) {
     rex_nx_reserve_pool();
     appletSetAutoSleepDisabled(true);
     raise_clocks();
+    // Only the game's own quit and EXIT GAME go back to hbloader (rex_nx_quick_exit); every other end of the process
+    // (HOME -> Close, abort, a fatal error) stays svcExitProcess.
+    if (envHasNextLoad() && access("sdmc:/switch/tmnt/exithome", F_OK) != 0) loader_return = envGetExitFuncPtr();
+    std::printf("[nx] the game's quit goes back to %s\n",
+                loader_return ? "hbmenu (sdmc:/switch/tmnt/exithome = the HOME menu)" : "the HOME menu");
     envSetExitFuncPtr(end_process);
-    register_thread(threadGetSelf(), "main");
+    main_thread = threadGetSelf();
+    register_thread(main_thread, "main");
     const bool rm_spin = access("sdmc:/switch/tmnt/nospin", F_OK) != 0;
     rex_nx_rm_spin_enable(rm_spin);
     if (FILE* f = std::fopen("sdmc:/switch/tmnt/waitspin_us", "r")) {
@@ -960,6 +987,7 @@ extern "C" void userAppExit(void) {
     log_flush_running = false;
     threadWaitForExit(&log_flush_thread);
     threadClose(&log_flush_thread);
+    appletSetAutoSleepDisabled(false);  // hbmenu may run on in this process
     restore_clocks();
     std::fflush(stdout);
     fsync(fileno(stdout));
@@ -974,20 +1002,55 @@ extern "C" void userAppExit(void) {
 // (svcSetThreadActivity), the applet's Exit is sent (libnx sends ISelfController::Exit only as an NSO; as an NRO it
 // leaves that to hbloader, and a title-takeover application that ends without it gets the error screen), then libnx's
 // own exit closes the services and ends the process.
-extern "C" [[noreturn]] void rex_nx_quick_exit(const char* why) {
-    std::printf("[nx] exit: %s: the other threads are paused, then libnx's exit\n", why);
+// to_menu (the game's quit, EXIT GAME) with hbloader's return kept (loader_return): no ISelfController::Exit, the
+// paused threads' stacks and the guest memory give their heap pages back, and libnx's exit ends in return_to_loader,
+// which hands the process back to hbloader: it loads hbmenu. hbloader goes on with the thread that returns to it as its
+// main thread, so another thread hands the exit to the UI loop (windowed_app_context_nx.cpp, every 16 ms) and is
+// paused there; if the loop does not take it within 2 s, that thread ends the process the old way.
+extern "C" const char* rex_nx_exit_request(void) { return exit_request.load(); }
+
+extern "C" [[noreturn]] void rex_nx_quick_exit(const char* why, bool to_menu) {
+    if (to_menu && loader_return && threadGetSelf() != main_thread) {
+        exit_request.store(why);
+        svcSleepThread(2'000'000'000LL);
+        std::printf("[nx] exit: the UI loop did not take \"%s\" within 2 s\n", why);
+    }
+    if (exit_claimed.exchange(true))
+        for (;;) svcSleepThread(INT64_MAX);  // another thread is on its way out
+    const bool to_loader = to_menu && loader_return && threadGetSelf() == main_thread && !nx_threads_full;
+    std::printf("[nx] exit: %s: the other threads are paused, then libnx's exit to %s\n", why,
+                to_loader ? "hbloader (hbmenu)" : "the HOME menu");
     userAppExit();
     const Handle self = threadGetCurHandle();
-    unsigned paused = 0, failed = 0;
+    unsigned paused = 0, failed = 0, stacks = 0;
+    bool was_paused[64] = {};
     mutexLock(&nx_threads_lock);
-    for (NxThread& t : nx_threads)
-        if (t.thread && t.handle != self) (R_SUCCEEDED(svcSetThreadActivity(t.handle, ThreadActivity_Paused)) ? paused : failed)++;
+    for (NxThread& t : nx_threads) {
+        if (!t.thread || t.handle == self) continue;
+        // A thread that has ended fails here: its handle is closed.
+        was_paused[&t - nx_threads] = R_SUCCEEDED(svcSetThreadActivity(t.handle, ThreadActivity_Paused));
+        (was_paused[&t - nx_threads] ? paused : failed)++;
+    }
+    // A paused thread never runs again: its stack mirror (svcMapMemory, threadCreate) goes, its heap pages come back.
+    for (NxThread& t : nx_threads) {
+        MemoryInfo mi;
+        u32 pi;
+        if (to_loader && was_paused[&t - nx_threads] &&
+            R_SUCCEEDED(svcQueryMemory(&mi, &pi, reinterpret_cast<u64>(t.thread->stack_mirror))) &&
+            mi.addr == reinterpret_cast<u64>(t.thread->stack_mirror) &&
+            R_SUCCEEDED(svcUnmapMemory(t.thread->stack_mirror, t.thread->stack_mem, mi.size)))
+            stacks++;
+    }
     mutexUnlock(&nx_threads_lock);
     std::printf("[nx] exit: %u threads paused, %u not\n", paused, failed);
+    if (to_loader)
+        std::printf("[nx] exit: %u thread stacks and %u guest memory blocks released\n", stacks, rex_nx_release_memory());
     std::fflush(stdout);
     fsync(fileno(stdout));
     const AppletType type = appletGetAppletType();
-    if (type == AppletType_Application || type == AppletType_SystemApplication)
+    if (to_loader)
+        envSetExitFuncPtr(return_to_loader);
+    else if (type == AppletType_Application || type == AppletType_SystemApplication)
         serviceDispatch(appletGetServiceSession_SelfController(), 0);  // ISelfController::Exit
     __libnx_exit(0);
 }

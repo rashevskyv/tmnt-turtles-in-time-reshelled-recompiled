@@ -359,6 +359,21 @@ extern "C" void rex_nx_reserve_pool(void) {
     print_heap_state("after the arena pool");
 }
 
+// On the way back to hbloader (rex_nx_quick_exit, the other threads paused): the blocks give the heap pages behind
+// them back, as hbloader hands the same heap to the next NRO. Returns the blocks released.
+extern "C" unsigned rex_nx_release_memory(void) {
+    using namespace rex::memory;
+    unsigned released = 0;
+    for (Block& block : blocks) {
+        if (block.handle == INVALID_HANDLE) continue;
+        if (block.mapped &&
+            R_FAILED(svcControlCodeMemory(block.handle, CodeMapOperation_UnmapOwner, arena.base + block.guest_start, block.size, 0)))
+            continue;
+        if (R_SUCCEEDED(svcCloseHandle(block.handle))) released++;
+    }
+    return released;
+}
+
 // The host address of guest physical memory (the 0xA0000000 block), or null before it is mapped.
 extern "C" const uint8_t* rex_nx_physical_base(void) {
     using namespace rex::memory;

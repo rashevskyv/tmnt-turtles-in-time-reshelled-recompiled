@@ -4,7 +4,7 @@
 // underneath and sees an idle pad. Drawn by the present pass as a text grid (rex_nx_menu_overlay).
 #include <rex/nx_menu.h>
 
-extern "C" [[noreturn]] void rex_nx_quick_exit(const char* why);  // switch/host/switch_nx.cpp
+extern "C" [[noreturn]] void rex_nx_quick_exit(const char* why, bool to_menu);  // switch/host/switch_nx.cpp
 
 #include <switch.h>
 
@@ -195,7 +195,9 @@ void Act() {
     return;
   }
   Save();
-  rex_nx_quick_exit("the settings menu's EXIT GAME");  // switch_nx.cpp: log, clocks back, svcExitProcess
+  // rex_nx_menu_input's lock: rex_nx_quick_exit never returns and may wait for the UI loop, the present pass draws on.
+  g_mutex.unlock();
+  rex_nx_quick_exit("the settings menu's EXIT GAME", true);  // switch_nx.cpp: back to hbmenu when it started the NRO
 }
 
 }  // namespace
