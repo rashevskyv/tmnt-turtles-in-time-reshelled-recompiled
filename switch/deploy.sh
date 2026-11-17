@@ -33,6 +33,10 @@ case "${1:-push}" in
         mkdir -p switch/logs
         # The game's log is tmnt_log_<build id>.txt (switch_nx.cpp open_log): the id of the local build.
         ID=$(grep -o 'TMNT_BUILD_ID "[^"]*"' "$BUILD/tmnt_version.h" 2>/dev/null | cut -d'"' -f2 || true)
+        # No local build (no id): the newest tmnt_log_*.txt on the console, by the build time at the end of its name
+        # (<version>-<YYYYMMDDTHHMMZ>; a version sort would put 0.100 before 0.99).
+        [ -n "$ID" ] || ID=$(curl -sS "ftp://$CLX_FTP/switch/tmnt/" | tr -d '\r' | awk '{print $NF}' |
+            sed -n 's/^tmnt_log_\(.*-\([0-9]\{8\}T[0-9]\{4\}Z\)\)\.txt$/\2 \1/p' | sort | tail -n 1 | cut -d' ' -f2 || true)
         for log in "tmnt_log${ID:+_$ID}.txt" tmnt_rex_log.txt; do
             curl -sS -o "switch/logs/$log" "ftp://$CLX_FTP/switch/tmnt/$log" && echo "switch/logs/$log" || true
         done

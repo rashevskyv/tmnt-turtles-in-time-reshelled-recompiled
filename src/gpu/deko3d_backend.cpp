@@ -717,9 +717,26 @@ class Deko3dCommandProcessor : public CommandProcessor {
   // Spike analysis (renut-ref PLAN-renut-leftovers.md P0.3, console spikes of 1.37 s): one line for each upload,
   // shader load, swapchain acquire or fence wait longer than 20 ms, with its time and the swap it belongs to.
   // id: the texture address, the shader hash, the swapchain slot or the frame slot.
+  // At most 5 lines a second, without Log's fflush (the log thread flushes): a stall of many slow loads must not
+  // add its own card writes. The lines over the limit are only counted; the next printed line gives their number.
   void LogSlow(const char* what, unsigned long long id, double ms) const {
-    if (ms > 20.0) Log("slow %s %llX: %.1f ms, swap #%u", what, id, ms, swaps_ + 1);
+    if (ms <= 20.0) return;
+    const double now = NowMs();
+    if (now - slow_window_ms_ >= 1000.0) {
+      slow_window_ms_ = now;
+      slow_lines_ = 0;
+    }
+    if (++slow_lines_ > 5) {
+      slow_dropped_++;
+      return;
+    }
+    std::printf("[dk] slow %s %llX: %.1f ms, swap #%u", what, id, ms, swaps_ + 1);
+    if (slow_dropped_) std::printf(" (%u slow lines before this one not printed)", slow_dropped_);
+    std::printf("\n");
+    slow_dropped_ = 0;
   }
+  mutable double slow_window_ms_ = 0;  // LogSlow: the start of the current second, its printed lines, the lines not printed
+  mutable uint32_t slow_lines_ = 0, slow_dropped_ = 0;
   struct SlowScope {  // LogSlow over a whole function with many returns
     const Deko3dCommandProcessor* self;
     const char* what;

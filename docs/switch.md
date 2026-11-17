@@ -10,7 +10,7 @@ A homebrew NRO for a Switch running Atmosphère, built from the same recompiled 
 | `/switch/tmnt/tmnt.nro` | The program (start it from hbmenu, with full RAM: hold R while you open a game) |
 | `/switch/tmnt/game/` | Your package's files: `default.xex`, `TMNT_r.xex`, `Data/`, ... (the same files as the PC `game` folder) |
 | `/switch/tmnt/deko3d`, `/switch/tmnt/shaders/` | The renderer marker and its compiled shaders |
-| `/switch/tmnt/tmnt_log.txt` | The log of the last run |
+| `/switch/tmnt/tmnt_log_<build id>.txt` | The log of each build (`<version>-<build time>`); the newest one is the last run |
 
 The licence is the full game (`--license_mask`, as `config/tmnt_turtles_in_time_reshelled.toml` on PC).
 Rumble works. **L3 + R3** opens the settings menu: frame rate, rumble, volume, fps counter, button icons,
@@ -21,7 +21,7 @@ The game hooks of the PC build are in, except online play: the FIRE menu has no 
 
 Create an empty `/switch/tmnt/dk_gpu_checkpoints` file on the SD card and restart the game.
 Save any previous `dk_gpu_fault.txt` and `dk_gpu_pending.txt` before testing.
-Reproduce the fault, then collect the new reports and `tmnt_log.txt` from the same folder.
+Reproduce the fault, then collect the new reports and the newest `tmnt_log_<build id>.txt` from the same folder.
 The report shows the last completed checkpoint and the next checkpoint in the command list.
 If the fence stays busy for 120 skipped frames, `dk_gpu_pending.txt` records a snapshot while the GPU may still be running.
 With the marker present, the renderer ignores the `dk_skip` shader list.
