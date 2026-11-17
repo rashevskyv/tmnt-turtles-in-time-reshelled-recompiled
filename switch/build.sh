@@ -58,8 +58,10 @@ SHA=$(git -c safe.directory="*" -C "$GIT_DIR" rev-parse --short=7 HEAD 2>/dev/nu
 DIRTY=$(git -c safe.directory="*" -c core.autocrlf=true -C "$GIT_DIR" status --porcelain --untracked-files=no 2>/dev/null | grep -q . && echo "+" || true)
 VERSION="0.$COUNT.$SHA$DIRTY"
 STAMP=$(date -u +%Y-%m-%dT%H:%MZ)
+# The build id names the log (tmnt_log_<id>.txt): two builds of one commit do not write over each other's log.
+BUILD_ID="$VERSION-${STAMP//[-:]/}"
 mkdir -p "$BUILD"
-printf '#define TMNT_VERSION "%s"\n#define TMNT_BUILD_UTC "%s"\n' "$VERSION" "$STAMP" > "$BUILD/tmnt_version.h.new"
+printf '#define TMNT_VERSION "%s"\n#define TMNT_BUILD_UTC "%s"\n#define TMNT_BUILD_ID "%s"\n' "$VERSION" "$STAMP" "$BUILD_ID" > "$BUILD/tmnt_version.h.new"
 if ! cmp -s "$BUILD/tmnt_version.h.new" "$BUILD/tmnt_version.h" 2>/dev/null; then
     mv "$BUILD/tmnt_version.h.new" "$BUILD/tmnt_version.h"
 else

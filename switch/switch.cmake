@@ -26,6 +26,12 @@ add_compile_definitions(VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL=0)
 add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-include>"
                     "$<$<COMPILE_LANGUAGE:C,CXX>:${REXGLUE_SWITCH_INCLUDE_DIR}/switch_compat.h>")
 include_directories(${REXGLUE_SWITCH_INCLUDE_DIR})
+# -mearly-ra=none (renut_nx_ultimate_base app/CMakeLists.txt, from peggle2-nx): devkitA64 GCC 16.1's AArch64 early
+# register allocation pass (on at -O2 and above) dropped table lookups of the NEON vperm helper and overwrote a constant's
+# register in Peggle 2's console build: large textures were garbage on the console only. Here, before the SDK is added,
+# so the SDK and FFmpeg get it too.
+add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-mearly-ra=none>")
+add_link_options(-mearly-ra=none)
 # devkitPro makes Release "-g -O2": the recompiled guest code gets -O3 like the SDK.
 foreach(lang C CXX)
     string(REPLACE "-O2" "-O3" CMAKE_${lang}_FLAGS_RELEASE "${CMAKE_${lang}_FLAGS_RELEASE}")

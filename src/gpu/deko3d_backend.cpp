@@ -647,6 +647,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     uint64_t hash = tmnt::UcodeHash(host_address, dword_count);
     auto it = shaders_.find(hash);
     if (it != shaders_.end()) return it->second;
+    const SlowScope slow{this, shader_type == xenos::ShaderType::kVertex ? "LoadShader VS" : "LoadShader PS", hash};
     DkShaderObj* shader = new DkShaderObj(shader_type, hash, host_address, dword_count);
     string::StringBuffer disasm;
     shader->AnalyzeUcode(disasm);
@@ -713,6 +714,19 @@ class Deko3dCommandProcessor : public CommandProcessor {
   static double NowMs() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
   }
+  // Spike analysis (renut-ref PLAN-renut-leftovers.md P0.3, console spikes of 1.37 s): one line for each upload,
+  // shader load, swapchain acquire or fence wait longer than 20 ms, with its time and the swap it belongs to.
+  // id: the texture address, the shader hash, the swapchain slot or the frame slot.
+  void LogSlow(const char* what, unsigned long long id, double ms) const {
+    if (ms > 20.0) Log("slow %s %llX: %.1f ms, swap #%u", what, id, ms, swaps_ + 1);
+  }
+  struct SlowScope {  // LogSlow over a whole function with many returns
+    const Deko3dCommandProcessor* self;
+    const char* what;
+    unsigned long long id;
+    double t0 = NowMs();
+    ~SlowScope() { self->LogSlow(what, id, NowMs() - t0); }
+  };
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count, IndexBufferInfo* index_buffer_info,
                  bool major_mode_explicit) override {
     const double t0 = NowMs();
@@ -1411,6 +1425,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     int slot = dkQueueAcquireImage(queue_, swapchain_);
     t_acquire_ms_ += NowMs() - acq0;
     rex_nx_waited_add(uint64_t((NowMs() - acq0) * 19200.0));
+    LogSlow("acquire", unsigned(slot), NowMs() - acq0);
     if (swaps_ < 5) Log("swap #%u: slot %d", swaps_ + 1, slot);
     HostImage* target = swap_images_[slot];
     dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
@@ -1893,6 +1908,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       DkResult r = dkFenceWait(&f.fence, 2000000000ll);  // 2 s: a hang is logged, not silent
       t_fence_ms_ += NowMs() - fw0;
       rex_nx_waited_add(uint64_t((NowMs() - fw0) * 19200.0));
+      LogSlow("fence wait", frame_, NowMs() - fw0);
       // A fence done without the frame's end timestamp: the kernel signalled it after a GPU fault (console 0.57,
       // the first cutscene; the next acquire then aborts). A hung or faulted frame's new shader pairs go to dk_skip.
       const uint64_t* ts = f.ts_off != UINT32_MAX ? reinterpret_cast<const uint64_t*>(f.data.cpu + f.ts_off) : nullptr;
@@ -2708,6 +2724,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
 
   bool UploadTexture(Frame& f, HostImage& img, const TextureInfo& info, const TexSource& s, xenos::Endian endian,
                      uint32_t layer = 0, uint32_t mip = 0) {
+    const SlowScope slow{this, "UploadTexture", s.address};
     const FormatInfo* fi = info.format_info();
     const uint32_t width = s.width, height = s.height;
     if (!width || !height || width > img.width || height > img.height) {

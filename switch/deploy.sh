@@ -4,7 +4,7 @@
 # push: tmnt.nro (NACP version checked first), the deko3d marker and every staged shader, each through
 #       switch/push_verified.sh (.part upload, read-back, SHA-1, rename).
 # game: the extracted game ($TMNT_ROOT/src/game/extracted) -> sdmc:/switch/tmnt/game/, file by file, verified.
-# logs: tmnt_log.txt and tmnt_rex_log.txt -> switch/logs/ (git-ignored).
+# logs: tmnt_log_<build id>.txt and tmnt_rex_log.txt -> switch/logs/ (git-ignored).
 set -eu
 cd "$(dirname "$0")/.."
 export CLX_FTP=${TMNT_FTP:-192.168.50.69:5000}
@@ -31,7 +31,9 @@ case "${1:-push}" in
         ;;
     logs)
         mkdir -p switch/logs
-        for log in tmnt_log.txt tmnt_rex_log.txt; do
+        # The game's log is tmnt_log_<build id>.txt (switch_nx.cpp open_log): the id of the local build.
+        ID=$(grep -o 'TMNT_BUILD_ID "[^"]*"' "$BUILD/tmnt_version.h" 2>/dev/null | cut -d'"' -f2 || true)
+        for log in "tmnt_log${ID:+_$ID}.txt" tmnt_rex_log.txt; do
             curl -sS -o "switch/logs/$log" "ftp://$CLX_FTP/switch/tmnt/$log" && echo "switch/logs/$log" || true
         done
         ;;
