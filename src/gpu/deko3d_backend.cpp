@@ -302,6 +302,7 @@ struct Frame {
 
 // Xenos CompareFunction is 0..7 (never .. always), DkCompareOp is 1..8 in the same order.
 DkCompareOp CompareOp(xenos::CompareFunction f) { return DkCompareOp(uint32_t(f) + 1); }
+DkStencilOp StencilOpOf(xenos::StencilOp o) { return DkStencilOp(uint32_t(o) + 1); }  // keep, zero, replace, incr, decr, invert, wraps
 
 DkBlendFactor BlendFactor(xenos::BlendFactor f) {
   switch (f) {
@@ -772,15 +773,11 @@ class Deko3dCommandProcessor : public CommandProcessor {
     bool writes_depth = dc.z_enable && dc.z_write_enable;
     if (!writes_color && !writes_depth && !dc.stencil_enable) { skipped_++; return true; }
     if (IsClearDraw(vs, ps, prim_type)) return ClearDraw(index_count, mode);
-    // ponytail: stencil is not implemented (stencilTestEnable = 0 for every draw), so a draw that writes neither
-    // colour nor depth changes nothing; console 0.88 spent 21 ms of a 96 ms level frame on them. When stencil is
-    // implemented these draws must run again, with a trivial fragment shader.
-    if (!writes_color && !writes_depth) {
-      LogOnce("stencilonly", "draw PS %016llX writes neither colour nor depth (stencil only): skipped, stencil is not implemented",
-              (unsigned long long)ps->ucode_data_hash());
-      frame_stencil_only_++;
-      return true;
-    }
+    // A draw that writes neither colour nor depth writes the stencil (a mask, e.g. the HUD health bar of the FIRE
+    // clip). It runs with the colour mask 0, so the pixel shader's variant without colour outputs (variant bit 2).
+    // ponytail: console 0.88 spent 21 ms of a 96 ms level frame on these draws; the swap line counts them.
+    if (dc.stencil_enable) frame_stencil_++;
+    if (!writes_color && !writes_depth) frame_stencil_only_++;
     if (!vs->loaded || !ps->loaded) { missing_draws_++; frame_missing_++; return true; }
     DkPrimitive prim;
     bool rects;
@@ -1027,14 +1024,16 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // Face culling for triangles: the book's page turn draws the page mesh twice (front faces with the
     // front texture, back faces with the mirrored one); without culling the left page came out mirrored
     // (console 0.141). Xenos face 0 = front is CCW as seen on screen; the cvar inverts it if the picture says so.
-    if (REXCVAR_GET(deko3d_cull) != 0 && (prim_type == xenos::PrimitiveType::kTriangleList ||
-                                          prim_type == xenos::PrimitiveType::kTriangleStrip ||
-                                          prim_type == xenos::PrimitiveType::kTriangleFan ||
-                                          prim_type == xenos::PrimitiveType::kQuadList || prim_type == xenos::PrimitiveType::kQuadStrip)) {
-      rs.cullMode = su.cull_front ? (su.cull_back ? DkFace_FrontAndBack : DkFace_Front)
-                                  : (su.cull_back ? DkFace_Back : DkFace_None);
+    const bool polygonal = prim_type == xenos::PrimitiveType::kTriangleList || prim_type == xenos::PrimitiveType::kTriangleStrip ||
+                           prim_type == xenos::PrimitiveType::kTriangleFan || prim_type == xenos::PrimitiveType::kQuadList ||
+                           prim_type == xenos::PrimitiveType::kQuadStrip;
+    if (polygonal) {
+      // The front face also picks the stencil face (RB_DEPTHCONTROL backface_enable).
       const bool front_cw = (su.face != 0) != (REXCVAR_GET(deko3d_cull) == 2);
       rs.frontFace = front_cw ? DkFrontFace_CW : DkFrontFace_CCW;
+      if (REXCVAR_GET(deko3d_cull) != 0)
+        rs.cullMode = su.cull_front ? (su.cull_back ? DkFace_FrontAndBack : DkFace_Front)
+                                    : (su.cull_back ? DkFace_Back : DkFace_None);
     }
     rs.fillRectangleEnable = rects && !use_gs;
     dkCmdBufBindRasterizerState(cmd, &rs);
@@ -1066,7 +1065,35 @@ class Deko3dCommandProcessor : public CommandProcessor {
       ds.depthWriteEnable = 1;
       ds.depthCompareOp = DkCompareOp_Always;
     }
-    ds.stencilTestEnable = 0;
+    // Stencil (RB_DEPTHCONTROL, RB_STENCILREFMASK and its _BF twin for the back faces, as the Vulkan backend reads them).
+    const bool stencil = depth && dc.stencil_enable && !depth_restore;
+    ds.stencilTestEnable = stencil;
+    if (stencil) {
+      const bool bf = polygonal && dc.backface_enable;
+      ds.stencilFrontCompareOp = CompareOp(dc.stencilfunc);
+      ds.stencilFrontFailOp = StencilOpOf(dc.stencilfail);
+      ds.stencilFrontDepthFailOp = StencilOpOf(dc.stencilzfail);
+      ds.stencilFrontPassOp = StencilOpOf(dc.stencilzpass);
+      ds.stencilBackCompareOp = CompareOp(bf ? dc.stencilfunc_bf : dc.stencilfunc);
+      ds.stencilBackFailOp = StencilOpOf(bf ? dc.stencilfail_bf : dc.stencilfail);
+      ds.stencilBackDepthFailOp = StencilOpOf(bf ? dc.stencilzfail_bf : dc.stencilzfail);
+      ds.stencilBackPassOp = StencilOpOf(bf ? dc.stencilzpass_bf : dc.stencilzpass);
+      const auto front = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK);
+      const auto back = bf ? regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF) : front;
+      dkCmdBufSetStencil(cmd, DkFace_Front, front.stencilwritemask, front.stencilref, front.stencilmask);
+      dkCmdBufSetStencil(cmd, DkFace_Back, back.stencilwritemask, back.stencilref, back.stencilmask);
+      if (FirstTime(pair_key ^ 0x5354454E43494C00ull)) {
+        // Each shader pair's first stencil draw, once.
+        Log("stencil draw VS %016llX PS %016llX: func %u ref %02X mask %02X write %02X ops fail %u zfail %u zpass %u; back %s func %u "
+            "ref %02X mask %02X write %02X ops %u %u %u; z %u/%u func %u, colour mask %04x; scissor %u,%u %ux%u; depth target EDRAM %u %ux%u",
+            (unsigned long long)vs->ucode_data_hash(), (unsigned long long)ps->ucode_data_hash(), uint32_t(dc.stencilfunc),
+            front.stencilref, front.stencilmask, front.stencilwritemask, uint32_t(dc.stencilfail), uint32_t(dc.stencilzfail),
+            uint32_t(dc.stencilzpass), bf ? "own" : "= front", uint32_t(dc.stencilfunc_bf), back.stencilref, back.stencilmask,
+            back.stencilwritemask, uint32_t(dc.stencilfail_bf), uint32_t(dc.stencilzfail_bf), uint32_t(dc.stencilzpass_bf),
+            dc.z_enable, dc.z_write_enable, uint32_t(dc.zfunc), color_mask, scissor.x, scissor.y, scissor.width, scissor.height,
+            uint32_t(depth_info.depth_base), depth->width, depth->height);
+      }
+    }
     dkCmdBufBindDepthStencilState(cmd, &ds);
 
     if (!skip_pairs_.empty() && skip_pairs_.count(PairKey({vs->ucode_data_hash(), ps->ucode_data_hash()}))) { skipped_++; return true; }
@@ -1649,9 +1676,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     frame_uploaded_.clear();
     if (swaps_ <= 3 || swaps_ % 60 == 0) {
       std::printf("[nx] gpu: swap #%u\n", swaps_);  // the Eden gate's frame counter
-      Log("swap #%u: front %08X %ux%u %s; frame: %u draws, %u clears, %u resolves, %u skipped, %u stencil-only skipped, %u no-shader, %u re-uploads, %llu dirty pages; data %u KB staging %u KB; images %u (%u MB)",
+      Log("swap #%u: front %08X %ux%u %s; frame: %u draws, %u clears, %u resolves, %u skipped, %u stencil draws (%u stencil only), %u no-shader, %u re-uploads, %llu dirty pages; data %u KB staging %u KB; images %u (%u MB)",
           swaps_, frontbuffer_ptr, frontbuffer_width, frontbuffer_height, front ? "shown" : "MISSING", frame_draws_,
-          frame_clears_, frame_resolves_, frame_skipped_, frame_stencil_only_, frame_missing_, frame_reuploads_, (unsigned long long)(dirty_pages_ - dirty_pages_at_swap_),
+          frame_clears_, frame_resolves_, frame_skipped_, frame_stencil_, frame_stencil_only_, frame_missing_, frame_reuploads_, (unsigned long long)(dirty_pages_ - dirty_pages_at_swap_),
           f.data.used >> 10, f.staging.used >> 10, image_count_, images_.used >> 20);
     }
     data_peak_ = std::max(data_peak_, f.data.used);
@@ -1662,7 +1689,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     frame_ring_full_ = 0;
     dirty_pages_at_swap_ = dirty_pages_;
-    frame_draws_ = frame_clears_ = frame_resolves_ = frame_skipped_ = frame_stencil_only_ = frame_missing_ = frame_reuploads_ = 0;
+    frame_draws_ = frame_clears_ = frame_resolves_ = frame_skipped_ = frame_stencil_ = frame_stencil_only_ = frame_missing_ = frame_reuploads_ = 0;
     frame_sprite_draws_ = 0;
     frame_big_tex_ = false;
     frame_mip_only_ = false;
@@ -3048,6 +3075,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
     auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
     uint32_t scale = surf.msaa_samples == xenos::MsaaSamples::k4X ? 2 : 1;
     uint32_t pitch = EffectivePitch(surf);
+    const auto clear_dc = draw_util::GetNormalizedDepthControl(regs);
+    const auto clear_srm = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK);
+    const uint8_t stencil_mask = clear_dc.stencil_enable && clear_dc.stencilzpass == xenos::StencilOp::kReplace ? clear_srm.stencilwritemask : 0;
+    const uint8_t stencil_ref = clear_srm.stencilref;
     auto word = [&](uint32_t i) {
       uint32_t w = words[i];
       if (fetch.endian == xenos::Endian::k8in32) w = __builtin_bswap32(w);
@@ -3087,15 +3118,17 @@ class Deko3dCommandProcessor : public CommandProcessor {
       if (sc.y + sc.height > h) sc.height = h - sc.y;
       dkCmdBufSetScissors(cmd, 0, &sc, 1);
       if (color_img) dkCmdBufClearColor(cmd, 0, DkColorMask_RGBA, color);
-      if (depth_img) dkCmdBufClearDepthStencil(cmd, true, z, 0xFF, 0);
+      // The stencil as the guest clear draw writes it (replace with its reference); a clear with the stencil off keeps
+      // the stencil (the mask a later draw tests).
+      if (depth_img) dkCmdBufClearDepthStencil(cmd, true, z, stencil_mask, stencil_ref);
       Checkpoint(f, "clear EDRAM color=%u depth=%u rect %u,%u %ux%u", color_info.color_base, depth_info.depth_base, sc.x, sc.y, sc.width, sc.height);
       {
         char key[96];
         std::snprintf(key, sizeof(key), "clear %u %u %u %u %u %u %u %u", uint32_t(mode), color_info.color_base, depth_info.depth_base, pitch,
                       sc.x, sc.y, sc.width, sc.height);
-        LogOnce(key, "clear %s%s at EDRAM %u/%u pitch %u: rect %u,%u %ux%u color %g %g %g %g z %g (alias x%u)", color_img ? "color" : "",
-                depth_img ? " depth" : "", color_info.color_base, depth_info.depth_base, pitch, sc.x, sc.y, sc.width, sc.height, color[0],
-                color[1], color[2], color[3], z, scale);
+        LogOnce(key, "clear %s%s at EDRAM %u/%u pitch %u: rect %u,%u %ux%u color %g %g %g %g z %g stencil %02X mask %02X (alias x%u)",
+                color_img ? "color" : "", depth_img ? " depth" : "", color_info.color_base, depth_info.depth_base, pitch, sc.x, sc.y,
+                sc.width, sc.height, color[0], color[1], color[2], color[3], z, stencil_ref, stencil_mask, scale);
       }
       clears_++;
       frame_clears_++;
@@ -3517,7 +3550,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   char hud_text_[32] = "";  // what the present pass draws top-left ("30 FPS  CPU 18.7 MS")
   uint32_t image_count_ = 0, uploads_ = 0, reuploads_ = 0;
   uint64_t upload_bytes_ = 0;
-  uint32_t frame_draws_ = 0, frame_clears_ = 0, frame_resolves_ = 0, frame_skipped_ = 0, frame_stencil_only_ = 0, frame_missing_ = 0,
+  uint32_t frame_draws_ = 0, frame_clears_ = 0, frame_resolves_ = 0, frame_skipped_ = 0, frame_stencil_ = 0, frame_stencil_only_ = 0, frame_missing_ = 0,
            frame_reuploads_ = 0;
   struct Uploaded { uint32_t base, bytes, serial; };  // by value: a recycled image may change hands within the frame
   std::vector<Uploaded> frame_uploaded_;  // uploads of this frame (cleared at the swap)
