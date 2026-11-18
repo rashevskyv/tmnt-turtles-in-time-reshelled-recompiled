@@ -574,6 +574,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     present_target_ = access((debug_dir + "dk_present_rt").c_str(), F_OK) == 0;
     no_variants_ = access((debug_dir + "dk_no_variants").c_str(), F_OK) == 0;
     if (no_variants_) Log("dk_no_variants: every draw binds the full pixel shader");
+    no_stencil_ = access((debug_dir + "dk_no_stencil").c_str(), F_OK) == 0;
+    if (no_stencil_) Log("dk_no_stencil: stencil off, stencil-only draws skipped, clears write stencil 0 (the backend before the stencil)");
     dump_images_ = access((debug_dir + "dk_dump").c_str(), F_OK) == 0;  // readback dumps stall the GPU: debug only
     debug_dir_ = debug_dir;
     gpu_checkpoints_ = access((debug_dir + "dk_gpu_checkpoints").c_str(), F_OK) == 0;
@@ -777,7 +779,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // clip). It runs with the colour mask 0, so the pixel shader's variant without colour outputs (variant bit 2).
     // ponytail: console 0.88 spent 21 ms of a 96 ms level frame on these draws; the swap line counts them.
     if (dc.stencil_enable) frame_stencil_++;
-    if (!writes_color && !writes_depth) frame_stencil_only_++;
+    if (!writes_color && !writes_depth) {
+      frame_stencil_only_++;
+      if (no_stencil_) return true;
+    }
     if (!vs->loaded || !ps->loaded) { missing_draws_++; frame_missing_++; return true; }
     DkPrimitive prim;
     bool rects;
@@ -1066,7 +1071,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       ds.depthCompareOp = DkCompareOp_Always;
     }
     // Stencil (RB_DEPTHCONTROL, RB_STENCILREFMASK and its _BF twin for the back faces, as the Vulkan backend reads them).
-    const bool stencil = depth && dc.stencil_enable && !depth_restore;
+    const bool stencil = depth && dc.stencil_enable && !depth_restore && !no_stencil_;
     ds.stencilTestEnable = stencil;
     if (stencil) {
       const bool bf = polygonal && dc.backface_enable;
@@ -3077,8 +3082,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     uint32_t pitch = EffectivePitch(surf);
     const auto clear_dc = draw_util::GetNormalizedDepthControl(regs);
     const auto clear_srm = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK);
-    const uint8_t stencil_mask = clear_dc.stencil_enable && clear_dc.stencilzpass == xenos::StencilOp::kReplace ? clear_srm.stencilwritemask : 0;
-    const uint8_t stencil_ref = clear_srm.stencilref;
+    const uint8_t stencil_mask = no_stencil_ ? 0xFF
+                                 : clear_dc.stencil_enable && clear_dc.stencilzpass == xenos::StencilOp::kReplace ? clear_srm.stencilwritemask : 0;
+    const uint8_t stencil_ref = no_stencil_ ? 0 : clear_srm.stencilref;
     auto word = [&](uint32_t i) {
       uint32_t w = words[i];
       if (fetch.endian == xenos::Endian::k8in32) w = __builtin_bswap32(w);
@@ -3430,6 +3436,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   bool restore_fs_ = false;
   bool present_target_ = false;
   bool no_variants_ = false;  // the file dk_no_variants: no pixel shader variants (IssueDrawImpl)
+  bool no_stencil_ = false;   // the file dk_no_stencil: no stencil test, stencil-only draws skipped (IssueDrawImpl)
 #ifndef TMNT_DK_GL
   // Port menu RECORD 5 SEC (nx_menu.cpp, switch/host/frame_recorder.cpp, from hcu-switch): the 1920x1080 guest front buffer of each
   // drawn frame is copied into rec_ (one slot per frame in flight) and handed to the recorder once the frame's fence has
