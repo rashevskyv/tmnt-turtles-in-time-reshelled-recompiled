@@ -1099,6 +1099,19 @@ class Deko3dCommandProcessor : public CommandProcessor {
             uint32_t(depth_info.depth_base), depth->width, depth->height);
       }
     }
+    if (depth_restore && !no_stencil_) {
+      // The Xenos restore writes whole D24S8 words, so the saved stencil comes back with the depth: bit 0, which the
+      // scene draws of both tiles set (ref 01, scissor 1280x384) and the lighting passes test (EQUAL 03 mask 03). The
+      // R32F copy holds no stencil and the host restore kept the old stencil: rows 384-719 never got bit 0 (hypothesis
+      // for console 0.104: the lighting left the clear colour there, a blue rectangle from row 384 down).
+      // ponytail: bit 0 is set on every restored pixel (the lighting runs everywhere, as with dk_no_stencil); the exact
+      // stencil needs a stencil copy in ResolveDepth.
+      ds.stencilTestEnable = 1;
+      ds.stencilFrontCompareOp = ds.stencilBackCompareOp = DkCompareOp_Always;
+      ds.stencilFrontPassOp = ds.stencilBackPassOp = DkStencilOp_Replace;
+      dkCmdBufSetStencil(cmd, DkFace_FrontAndBack, 0x01, 0x01, 0xFF);
+      LogOnce("depthrestore stencil", "depth restore: stencil bit 0 set on every restored pixel (the saved stencil is not kept)");
+    }
     dkCmdBufBindDepthStencilState(cmd, &ds);
 
     if (!skip_pairs_.empty() && skip_pairs_.count(PairKey({vs->ucode_data_hash(), ps->ucode_data_hash()}))) { skipped_++; return true; }
