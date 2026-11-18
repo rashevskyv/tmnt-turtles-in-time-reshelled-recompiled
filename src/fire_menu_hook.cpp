@@ -7,6 +7,11 @@
 #include "localization/active_language.h"
 #include "localization/font_patch.h"
 
+#ifdef __SWITCH__
+// Swaps the A/B and X/Y button glyphs in a menu bundle for the Switch layout (switch/host/nx_glyphs.cpp).
+extern "C" void rex_nx_swap_menu_glyphs(uint8_t* data, size_t size);
+#endif
+
 // (compressed, compressed size, output, output size pointer)
 REX_EXTERN(__imp__sub_824EC4C8);
 REX_HOOK_RAW(sub_824EC4C8) {
@@ -29,4 +34,8 @@ REX_HOOK_RAW(sub_824EC4C8) {
     REXLOG_INFO("Language: pt-BR font descriptors={} movie_fonts={} atlases={} in a bundle of {} bytes", font.descriptors,
                 font.movie_fonts, font.atlases, size);
   }
+#ifdef __SWITCH__
+  // Last: the movie edits and the font check the original bytes before they change them.
+  if (tmnt::IsMenuBundle(size)) rex_nx_swap_menu_glyphs(tmnt::GuestHost(base, output), size);
+#endif
 }
