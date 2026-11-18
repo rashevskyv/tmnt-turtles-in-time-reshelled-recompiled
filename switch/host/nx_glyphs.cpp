@@ -62,11 +62,12 @@ extern "C" void rex_nx_patch_file_read(const char* name, uint8_t* data, uint64_t
                     "%d keys swapped in %d files\n", g_headers, g_whole, g_pieces, g_cut, g_total, g_file_count);
     }
   }
+  int read_swapped = 0;
   for (Trailer& t : g_trailers) {
     if (!t.end || t.end <= file_offset || t.begin >= read_end) continue;
     const bool whole = t.begin >= file_offset && t.end <= read_end;
     whole ? g_whole++ : g_pieces++;
-    if (!whole && g_pieces_logged < 16) {
+    if (!whole && length < 12 && g_pieces_logged < 16) {  // a record (12 bytes) read in parts
       g_pieces_logged++;
       std::printf("[nx] glyphs: trailer of the file at %llu read in pieces: %zu bytes at %llu\n",
                   (unsigned long long)t.header, length, (unsigned long long)file_offset);
@@ -89,6 +90,7 @@ extern "C" void rex_nx_patch_file_read(const char* name, uint8_t* data, uint64_t
       }
     }
     if (!swapped) continue;
+    read_swapped += swapped;
     g_total += swapped;
     bool counted = false;
     for (int i = 0; i < g_file_count; i++) counted |= g_files[i] == t.header;
@@ -99,4 +101,18 @@ extern "C" void rex_nx_patch_file_read(const char* name, uint8_t* data, uint64_t
                 swapped, (unsigned long long)t.header, (unsigned long long)(t.end - t.begin), g_total, g_file_count);
     std::fflush(stdout);
   }
+  // Diagnostics only (nothing swapped here): glyph keys at any byte of the read beyond the swapped ones. A trailer whose
+  // header this hook missed, or the keys in another file (ps3_button_swap.swp at 1970927, 96 bytes, if the game loads it).
+  static int unswapped_logged = 0;
+  if (unswapped_logged >= 32 || length < 4) return;
+  int present = 0;
+  for (size_t i = 0; i + 4 <= length; i++) {
+    const uint32_t k = Load(data + i);
+    for (const Pair& pr : kSwap) present += k == pr.a || k == pr.b;
+  }
+  if (present <= read_swapped) return;
+  unswapped_logged++;
+  std::printf("[nx] glyphs: a read of %zu bytes at %llu holds %d glyph keys, %d of them swapped\n", length,
+              (unsigned long long)file_offset, present, read_swapped);
+  std::fflush(stdout);
 }
