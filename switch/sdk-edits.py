@@ -722,7 +722,15 @@ edit('src/system/xfile.cpp', [
      '#include <rex/system/xfile.h>' + NL + '#include <cstring>' + NL + '#include <vector>' + NL +
      '#if REX_PLATFORM_SWITCH' + NL +
      '// GPU dirty-page tracking of host writes into guest memory (switch/host/memory_nx.cpp).' + NL +
-     'extern "C" void rex_nx_mark_range(uint32_t guest, uint32_t length);' + NL + '#endif' + NL),
+     'extern "C" void rex_nx_mark_range(uint32_t guest, uint32_t length);' + NL +
+     '#include <algorithm>' + NL + '#include <cstdio>' + NL + '#include <mutex>' + NL +
+     '// Horizon IPC must never see guest memory (code-memory mappings jam the fs service): reads and writes' + NL +
+     '// bounce through this one fixed buffer, chunk by chunk. A heap copy of the whole request threw' + NL +
+     '// std::bad_alloc with the pool full from the start (console 0.106, xfile.cpp ReadInternal).' + NL +
+     '// ponytail: one buffer and one lock for all files; per-thread buffers if parallel reads ever matter.' + NL +
+     'namespace {' + NL + 'constexpr size_t kNxBounceSize = 1024 * 1024;' + NL +
+     'alignas(0x1000) uint8_t nx_bounce[kNxBounceSize];' + NL + 'std::mutex nx_bounce_lock;' + NL + '}  // namespace' + NL +
+     '#endif' + NL),
     ('          result = file_->ReadSync(' + NL +
      '              std::span<uint8_t>(' + NL +
      '                  buffer_physical_heap' + NL +
@@ -737,14 +745,28 @@ edit('src/system/xfile.cpp', [
      '                        buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))' + NL +
      '                  : memory()->TranslateVirtual(buffer_guest_address);' + NL +
      '#if REX_PLATFORM_SWITCH' + NL +
-     '          // Horizon IPC must never see guest memory (code-memory mappings jam the fs service):' + NL +
-     '          // bounce through the heap.' + NL +
-     '          std::vector<uint8_t> nx_bounce(buffer_length);' + NL +
-     '          result = file_->ReadSync(std::span<uint8_t>(nx_bounce.data(), buffer_length),' + NL +
-     '                                   size_t(byte_offset), &bytes_read);' + NL +
-     '          if (XSUCCEEDED(result) && bytes_read) {' + NL +
-     '            std::memcpy(guest_buffer, nx_bounce.data(), bytes_read);' + NL +
-     '            rex_nx_mark_range(buffer_guest_address, uint32_t(bytes_read));' + NL + '          }' + NL +
+     '          {' + NL +
+     '            std::lock_guard<std::mutex> nx_lock(nx_bounce_lock);' + NL +
+     '            while (bytes_read < buffer_length) {' + NL +
+     '              const size_t chunk = std::min<size_t>(buffer_length - bytes_read, kNxBounceSize);' + NL +
+     '              size_t got = 0;' + NL +
+     '              const X_STATUS r = file_->ReadSync(std::span<uint8_t>(nx_bounce, chunk),' + NL +
+     '                                                 size_t(byte_offset) + bytes_read, &got);' + NL +
+     '              if (XFAILED(r)) {' + NL +
+     '                if (!bytes_read) result = r;  // a later chunk at the end of the file: the bytes so far' + NL +
+     '                break;' + NL +
+     '              }' + NL +
+     '              std::memcpy(guest_buffer + bytes_read, nx_bounce, got);' + NL +
+     '              bytes_read += got;' + NL +
+     '              if (got < chunk) break;' + NL +
+     '            }' + NL +
+     '          }' + NL +
+     '          if (bytes_read) rex_nx_mark_range(buffer_guest_address, uint32_t(bytes_read));' + NL +
+     '          if (buffer_length > kNxBounceSize) {' + NL +
+     '            std::printf("[nx] file read: %s offset 0x%llX, %u bytes asked, %zu read, status 0x%X\\n",' + NL +
+     '                        file_->entry()->name().c_str(), (unsigned long long)byte_offset, buffer_length,' + NL +
+     '                        bytes_read, unsigned(result));' + NL +
+     '          }' + NL +
      '#else' + NL +
      '          result = file_->ReadSync(std::span<uint8_t>(guest_buffer, buffer_length),' + NL +
      '                                   size_t(byte_offset), &bytes_read);' + NL +
@@ -753,10 +775,20 @@ edit('src/system/xfile.cpp', [
      '      std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),' + NL +
      '      size_t(byte_offset), &bytes_written);' + NL,
      '#if REX_PLATFORM_SWITCH' + NL +
-     '  std::vector<uint8_t> nx_bounce(memory()->TranslateVirtual(buffer_guest_address),' + NL +
-     '                                 memory()->TranslateVirtual(buffer_guest_address) + buffer_length);' + NL +
-     '  X_STATUS result = file_->WriteSync(std::span<const uint8_t>(nx_bounce.data(), buffer_length),' + NL +
-     '                                     size_t(byte_offset), &bytes_written);' + NL +
+     '  X_STATUS result = X_STATUS_SUCCESS;' + NL +
+     '  {' + NL +
+     '    const uint8_t* src = memory()->TranslateVirtual(buffer_guest_address);' + NL +
+     '    std::lock_guard<std::mutex> nx_lock(nx_bounce_lock);' + NL +
+     '    while (bytes_written < buffer_length) {' + NL +
+     '      const size_t chunk = std::min<size_t>(buffer_length - bytes_written, kNxBounceSize);' + NL +
+     '      std::memcpy(nx_bounce, src + bytes_written, chunk);' + NL +
+     '      size_t put = 0;' + NL +
+     '      result = file_->WriteSync(std::span<const uint8_t>(nx_bounce, chunk),' + NL +
+     '                                size_t(byte_offset) + bytes_written, &put);' + NL +
+     '      bytes_written += put;' + NL +
+     '      if (XFAILED(result) || put < chunk) break;' + NL +
+     '    }' + NL +
+     '  }' + NL +
      '#else' + NL +
      '  X_STATUS result = file_->WriteSync(' + NL +
      '      std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),' + NL +
