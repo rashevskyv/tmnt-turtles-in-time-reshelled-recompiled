@@ -66,7 +66,7 @@ void Load() {
       if (!std::strcmp(line, "rumble")) g_rumble = v ? 1 : 0;
       if (!std::strcmp(line, "volume")) g_volume = v < 0 ? 0 : v > 100 ? 10 : v / 10;
       if (!std::strcmp(line, "fps_counter")) g_fps_counter = v ? 1 : 0;
-      if (!std::strcmp(line, "button_icons")) g_button_icons = v ? 1 : 0;
+      if (!std::strcmp(line, "button_icons2")) g_button_icons = v ? 1 : 0;  // "2": 0.102 saved button_icons=1 (then the default), and SWITCH crashes the menu bundle; the old key is skipped and dropped on the next save
       if (!std::strcmp(line, "skip_intro")) g_skip_intro = v ? 1 : 0;
       if (!std::strcmp(line, "language")) g_language = v < 0 || v > 5 ? 0 : v;
     }
@@ -93,7 +93,7 @@ void Save() {
     std::printf("[nx] settings: cannot write %s\n", kSettingsPath);
     return;
   }
-  std::fprintf(fp, "fps=%d\nrumble=%d\nvolume=%d\nfps_counter=%d\nbutton_icons=%d\nskip_intro=%d\nlanguage=%d\n",
+  std::fprintf(fp, "fps=%d\nrumble=%d\nvolume=%d\nfps_counter=%d\nbutton_icons2=%d\nskip_intro=%d\nlanguage=%d\n",
                g_fps_mode.load(), g_rumble.load(),
                g_volume.load() * 10, g_fps_counter.load(), g_button_icons.load(), g_skip_intro.load(), g_language.load());
   std::fclose(fp);
