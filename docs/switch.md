@@ -13,7 +13,7 @@ A homebrew NRO for a Switch running Atmosphère, built from the same recompiled 
 | `/switch/tmnt/tmnt_log_<build id>.txt` | The log of each build (`<version>-<build time>`); the newest one is the last run |
 
 The licence is the full game (`--license_mask`, as `config/tmnt_turtles_in_time_reshelled.toml` on PC).
-Rumble works. **L3 + R3** opens the settings menu: frame rate, rumble, volume, fps counter, button icons,
+Rumble works. **L3 + R3** opens the settings menu: frame rate, rumble, volume, fps counter, button icons (experimental, off by default),
 skip intro and the language (en, fr, de, it, es, pt-BR; the last two after a restart).
 The game hooks of the PC build are in, except online play: the FIRE menu has no Xbox Live entries.
 

@@ -24,7 +24,7 @@ constexpr uint16_t kUp = 0x0001, kDown = 0x0002, kLeft = 0x0004, kRight = 0x0008
                    kLS = 0x0040, kRS = 0x0080, kA = 0x1000, kB = 0x2000;
 constexpr uint16_t kChord = kLS | kRS;  // L3+R3 opens and closes the menu (minus = the 360's BACK opens the game's own menu)
 
-std::atomic<int> g_fps_mode{1}, g_rumble{1}, g_volume{10}, g_fps_counter{1}, g_button_icons{1}, g_skip_intro{0}, g_language{0};  // release defaults: 30 fps (every second frame drawn, the game at full speed), fps counter on; volume in steps of 10
+std::atomic<int> g_fps_mode{1}, g_rumble{1}, g_volume{10}, g_fps_counter{1}, g_button_icons{0}, g_skip_intro{0}, g_language{0};  // release defaults: 30 fps (every second frame drawn, the game at full speed), fps counter on, button icons XBOX (the SWITCH swap is experimental: e5ddce2 crashed the key scan); volume in steps of 10
 std::atomic<int> g_record{0};  // 1 = the backend records the shown frames for 5 s (frame_recorder.cpp, the file record_now), then sets 0
 
 struct Item {
@@ -38,7 +38,7 @@ Item kItems[] = {
     {"RUMBLE", &g_rumble, 2, {"OFF", "ON"}},
     {"VOLUME", &g_volume, 11, {"0", "10", "20", "30", "40", "50", "60", "70", "80", "90", "100"}},
     {"FPS COUNTER", &g_fps_counter, 2, {"OFF", "ON"}},
-    {"BUTTON ICONS *", &g_button_icons, 2, {"XBOX", "SWITCH"}},  // * = after a restart (nx_glyphs.cpp)
+    {"BUTTON ICONS BETA *", &g_button_icons, 2, {"XBOX", "SWITCH"}},  // * = after a restart (nx_glyphs.cpp); BETA: off by default, SWITCH can crash
     {"SKIP INTRO *", &g_skip_intro, 2, {"OFF", "ON"}},
     {"LANGUAGE *", &g_language, 6, {"EN", "FR", "DE", "IT", "ES", "PT-BR"}},  // rex_nx_setting_language
     {"EXIT GAME", nullptr, 0, {}},
