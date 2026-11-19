@@ -37,9 +37,9 @@ int main(int argc, char* argv[]) {
   // null backend: the command processor consumes the ring buffer and fires vblanks, nothing is drawn,
   // no presenter; the XEX, the kernel, memory, threads, files and input are real.
   const bool no_gpu = access("sdmc:/switch/tmnt/nogpu", F_OK) == 0;
-  // The native renderer (src/gpu/deko3d_backend.cpp): the file sdmc:/switch/tmnt/deko3d selects it
-  // (it wins over nogpu, so Eden's staging can keep both files).
-  const bool deko3d = access("sdmc:/switch/tmnt/deko3d", F_OK) == 0;
+  // The native renderer (src/gpu/deko3d_backend.cpp) is the default; nogpu alone selects the null backend. The file
+  // sdmc:/switch/tmnt/deko3d wins over nogpu, so Eden's staging can keep both files. Other: --gpu_backend in args.txt.
+  const bool deko3d = !no_gpu || access("sdmc:/switch/tmnt/deko3d", F_OK) == 0;
   // Extra arguments, one per line, from sdmc:/switch/tmnt/args.txt (Eden gives no argv and the
   // config file path depends on argv[0]): e.g. --log_noisy=true --log_level=trace for a kernel trace.
   if (FILE* fp = std::fopen("sdmc:/switch/tmnt/args.txt", "r")) {
