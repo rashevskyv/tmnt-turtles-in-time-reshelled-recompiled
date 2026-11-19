@@ -576,6 +576,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     dump_images_ = access((debug_dir + "dk_dump").c_str(), F_OK) == 0;  // readback dumps stall the GPU: debug only
     debug_dir_ = debug_dir;
     gpu_checkpoints_ = access((debug_dir + "dk_gpu_checkpoints").c_str(), F_OK) == 0;
+#ifndef TMNT_DK_GL
+    trail_ = access((debug_dir + "dk_trail").c_str(), F_OK) == 0;
+#endif
     missing_dir_ = shader_dir_ + "missing/";
 #ifndef TMNT_DK_GL
     // The shaders ship inside the NRO (romfs:/shaders/, switch/build.sh), so a build can not meet another build's
@@ -3461,11 +3464,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   std::vector<double> shown_ms_;
   bool gpu_reported_ = false;
   bool gpu_checkpoints_ = false;  // opt-in: sdmc:/switch/tmnt/dk_gpu_checkpoints
-#ifdef TMNT_DK_GL
-  bool trail_ = false;
-#else
-  bool trail_ = true;  // Checkpoint without the barriers, for the first level frames (BeginFrame ends it)
-#endif
+  bool trail_ = false;  // opt-in: sdmc:/switch/tmnt/dk_trail; Checkpoint without the barriers, for the first level frames (BeginFrame ends it)
   uint32_t trail_frames_ = 0;
   bool dump_images_ = false;
   bool trace_enabled_ = false, traced_ = false, trace_any_ = false;  // file dk_trace: one line per draw of the first frame with 440+ draws
