@@ -6,7 +6,8 @@
 // at the file read). Each FEU movie in a bundle has a texture list: a count, then (key, 0, type) triples, type 0x42 =
 // texture; 47 glyph triples in f88d0000 and 28 in f88d0002 (measured 2026-11-18). Only these references are swapped:
 // the bundle's object table holds the same keys as the textures' own names, and swapping both would cancel out.
-// The setting BUTTON ICONS = XBOX (nx_menu.cpp) leaves the bundles as they are from the next load.
+// disabled: breaks the menu bundle key scan, see commit e5ddce2, to be redone. rex_nx_setting_button_icons()
+// (nx_menu.cpp) is always 0 and the menu has no item for it, so the swap below never runs.
 #include <rex/nx_menu.h>
 
 #include <cstdint>
@@ -32,8 +33,8 @@ uint32_t Load(const uint8_t* p) {
 }  // namespace
 
 extern "C" void rex_nx_swap_menu_glyphs(uint8_t* data, size_t size) {
-  if (!rex_nx_setting_button_icons()) {
-    std::printf("[nx] glyphs: BUTTON ICONS = XBOX, the menu bundle of %zu bytes is left as it is\n", size);
+  if (!rex_nx_setting_button_icons()) {  // disabled: breaks the menu bundle key scan, see commit e5ddce2, to be redone
+    std::printf("[nx] glyphs: the swap is off, the menu bundle of %zu bytes is left as it is\n", size);
     return;
   }
   int swapped = 0;

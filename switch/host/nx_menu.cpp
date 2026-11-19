@@ -24,7 +24,7 @@ constexpr uint16_t kUp = 0x0001, kDown = 0x0002, kLeft = 0x0004, kRight = 0x0008
                    kLS = 0x0040, kRS = 0x0080, kA = 0x1000, kB = 0x2000;
 constexpr uint16_t kChord = kLS | kRS;  // L3+R3 opens and closes the menu (minus = the 360's BACK opens the game's own menu)
 
-std::atomic<int> g_fps_mode{1}, g_rumble{1}, g_volume{10}, g_fps_counter{1}, g_button_icons{0}, g_skip_intro{0}, g_language{0};  // release defaults: 30 fps (every second frame drawn, the game at full speed), fps counter on, button icons XBOX (the SWITCH swap is experimental: e5ddce2 crashed the key scan); volume in steps of 10
+std::atomic<int> g_fps_mode{1}, g_rumble{1}, g_volume{10}, g_fps_counter{1}, g_skip_intro{0}, g_language{0};  // release defaults: 30 fps (every second frame drawn, the game at full speed), fps counter on; volume in steps of 10
 std::atomic<int> g_record{0};  // 1 = the backend records the shown frames for 5 s (frame_recorder.cpp, the file record_now), then sets 0
 
 struct Item {
@@ -38,7 +38,6 @@ Item kItems[] = {
     {"RUMBLE", &g_rumble, 2, {"OFF", "ON"}},
     {"VOLUME", &g_volume, 11, {"0", "10", "20", "30", "40", "50", "60", "70", "80", "90", "100"}},
     {"FPS COUNTER", &g_fps_counter, 2, {"OFF", "ON"}},
-    {"BUTTON ICONS BETA *", &g_button_icons, 2, {"XBOX", "SWITCH"}},  // * = after a restart (nx_glyphs.cpp); BETA: off by default, SWITCH can crash
     {"SKIP INTRO *", &g_skip_intro, 2, {"OFF", "ON"}},
     {"LANGUAGE *", &g_language, 6, {"EN", "FR", "DE", "IT", "ES", "PT-BR"}},  // rex_nx_setting_language
     {"EXIT GAME", nullptr, 0, {}},
@@ -66,7 +65,7 @@ void Load() {
       if (!std::strcmp(line, "rumble")) g_rumble = v ? 1 : 0;
       if (!std::strcmp(line, "volume")) g_volume = v < 0 ? 0 : v > 100 ? 10 : v / 10;
       if (!std::strcmp(line, "fps_counter")) g_fps_counter = v ? 1 : 0;
-      if (!std::strcmp(line, "button_icons2")) g_button_icons = v ? 1 : 0;  // "2": 0.102 saved button_icons=1 (then the default), and SWITCH crashes the menu bundle; the old key is skipped and dropped on the next save
+      // button_icons (0.102-0.111) and button_icons2 are skipped and not written back: the glyph swap is off (nx_glyphs.cpp)
       if (!std::strcmp(line, "skip_intro")) g_skip_intro = v ? 1 : 0;
       if (!std::strcmp(line, "language")) g_language = v < 0 || v > 5 ? 0 : v;
     }
@@ -93,9 +92,9 @@ void Save() {
     std::printf("[nx] settings: cannot write %s\n", kSettingsPath);
     return;
   }
-  std::fprintf(fp, "fps=%d\nrumble=%d\nvolume=%d\nfps_counter=%d\nbutton_icons2=%d\nskip_intro=%d\nlanguage=%d\n",
+  std::fprintf(fp, "fps=%d\nrumble=%d\nvolume=%d\nfps_counter=%d\nskip_intro=%d\nlanguage=%d\n",
                g_fps_mode.load(), g_rumble.load(),
-               g_volume.load() * 10, g_fps_counter.load(), g_button_icons.load(), g_skip_intro.load(), g_language.load());
+               g_volume.load() * 10, g_fps_counter.load(), g_skip_intro.load(), g_language.load());
   std::fclose(fp);
   std::printf("[nx] settings: saved fps %d rumble %d volume %d fps_counter %d\n", g_fps_mode.load(), g_rumble.load(),
               g_volume.load() * 10, g_fps_counter.load());
@@ -206,7 +205,7 @@ extern "C" int rex_nx_setting_fps_mode(void) { return g_fps_mode.load(); }
 extern "C" int rex_nx_setting_rumble(void) { return g_rumble.load(); }
 extern "C" int rex_nx_setting_volume(void) { return g_volume.load() * 10; }
 extern "C" int rex_nx_setting_fps_counter(void) { return g_fps_counter.load(); }
-extern "C" int rex_nx_setting_button_icons(void) { return g_button_icons.load(); }
+extern "C" int rex_nx_setting_button_icons(void) { return 0; }  // always XBOX: the glyph swap is off (nx_glyphs.cpp)
 // Read once at start, before the menu has loaded the file.
 extern "C" int rex_nx_setting_skip_intro(void) {
   std::lock_guard<std::mutex> lock(g_mutex);
